@@ -705,6 +705,30 @@ def read_back_steps(app_token, userid, device_id=None, date=None,
     return result
 
 
+def _find_step_like(obj, path="", depth=0, out=None):
+    """递归查找响应中所有可能是"步数"的字段。
+
+    华米账号维度接口的字段名不固定（step / steps / todayStep / stepCount /
+    totalStep / step_target 等），且可能嵌套在 defaultFields / config 里。
+    """
+    if out is None:
+        out = []
+    if depth > 4 or not isinstance(obj, (dict, list)):
+        return out
+    if isinstance(obj, list):
+        for i, v in enumerate(obj[:5]):
+            _find_step_like(v, f"{path}[{i}]", depth + 1, out)
+        return out
+    for k, v in obj.items():
+        kl = str(k).lower()
+        if any(t in kl for t in ("step", "stride", "walk", "sport")) and \
+                isinstance(v, (int, float, str)) and not isinstance(v, bool):
+            out.append((f"{path}.{k}" if path else str(k), v))
+        elif isinstance(v, (dict, list)):
+            _find_step_like(v, f"{path}.{k}" if path else str(k), depth + 1, out)
+    return out
+
+
 def diagnose_sync(app_token, userid) -> dict:
     """诊断微信同步链路的最后两个未知环节。
 
@@ -742,15 +766,29 @@ def diagnose_sync(app_token, userid) -> dict:
             data = j.get("data") or {}
             # 账号维度常见的步数字段
             step = None
-            for k in ("step", "steps", "todayStep", "stepCount", "totalStep"):
+            for k in ("step", "steps", "todayStep", "stepCount", "totalStep", "currentStep"):
                 if k in data:
                     step = data[k]
                     break
-            print(f"账号维度查询: HTTP 200, 返回字段 {list(data.keys())[:12]}")
+            # 打印完整字段名（之前只打印前12个，会漏掉 step）
+            all_keys = list(data.keys())
+            print(f"账号维度查询: HTTP 200, 共 {len(all_keys)} 个字段")
+            print(f"  完整字段名: {all_keys}")
+            # 递归查找任何像步数的字段
+            found = _find_step_like(data)
+            if found:
+                for path, val in found:
+                    print(f"  ★ 疑似步数字段: {path} = {val}")
             if step is not None:
                 print(f"  ★ 账号维度步数 = {step}")
             else:
-                print("  （返回中未直接包含步数字段）")
+                print("  （顶层未直接包含步数字段）")
+            # 顺带打印几个与步数相关的健康指标，便于判断账号维度数据
+            for k in ("calories", "distance", "weight", "sleep", "heart_rate"):
+                if k in data:
+                    v = data[k]
+                    sv = json.dumps(v, ensure_ascii=False) if not isinstance(v, (int, float, str)) else v
+                    print(f"  · {k} = {str(sv)[:100]}")
             out["user_info"] = data
             out["account_step"] = step
         else:
@@ -759,38 +797,46 @@ def diagnose_sync(app_token, userid) -> dict:
         print(f"账号维度查询异常: {type(e).__name__} {str(e)[:120]}")
 
     # ---------- 2. 第三方接入（微信绑定）状态 ----------
-    try:
-        url2 = f"https://api-mifit-cn3.zepp.com/v1/user/thirdparty.json?userid={userid}"
-        h2 = {
-            "apptoken": app_token,
-            "User-Agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)",
-            "appname": "com.xiaomi.hm.health",
-            "appplatform": "android_phone",
-        }
-        r2 = requests.get(url2, headers=h2, timeout=12)
-        if r2.status_code == 200:
-            j2 = r2.json()
-            items = _extract_items(j2)
-            if items:
-                names = []
-                for it in items:
-                    if isinstance(it, dict):
-                        names.append({k: v for k, v in it.items()
-                                      if isinstance(k, str) and k.lower() in
-                                      ("name", "appname", "platform", "type", "status", "bindstatus")})
-                    else:
-                        names.append(str(it)[:60])
-                print(f"第三方接入查询: HTTP 200，共 {len(items)} 条")
-                for n in names[:8]:
-                    print(f"  - {n}")
-                out["third_party"] = items
-            else:
-                print(f"第三方接入查询: HTTP 200，响应: {str(j2)[:200]}")
-                out["third_party"] = j2
+    # 该接口路径不唯一，多个候选依次尝试，任何一个返回绑定信息即可
+    h2 = {
+        "apptoken": app_token,
+        "User-Agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)",
+        "appname": "com.xiaomi.hm.health",
+        "appplatform": "android_phone",
+    }
+    tp_candidates = [
+        f"https://api-mifit-cn3.zepp.com/v1/user/thirdparty.json?userid={userid}",
+        f"https://api-mifit-cn3.zepp.com/v1/user/third_party.json?userid={userid}",
+        f"https://api-mifit-cn.huami.com/v1/user/thirdparty.json?userid={userid}",
+        f"https://api-user.zepp.com/v1/user/thirdparty.json?userid={userid}",
+        f"https://api-mifit-cn3.zepp.com/huami.health.getThirdPartyInfo.json?userid={userid}",
+        f"https://api-mifit-cn3.zepp.com/v1/user/thirdparty_bind.json?userid={userid}",
+    ]
+    for url2 in tp_candidates:
+        try:
+            r2 = requests.get(url2, headers=h2, timeout=10)
+        except Exception as e:
+            print(f"第三方接入[{url2.split('/')[2]}{url2.split('/')[3][:28]}]: 异常 {type(e).__name__}")
+            continue
+        if r2.status_code != 200:
+            print(f"第三方接入[{url2.split('/')[2]}{url2.split('/')[3][:28]}]: HTTP {r2.status_code}")
+            continue
+        j2 = r2.json()
+        items = _extract_items(j2)
+        if items:
+            print(f"★ 第三方接入命中: {url2}")
+            for it in items[:8]:
+                if isinstance(it, dict):
+                    print(f"  - {json.dumps(it, ensure_ascii=False)[:180]}")
+                else:
+                    print(f"  - {str(it)[:120]}")
+            out["third_party"] = items
+            out["third_party_url"] = url2
+            break
         else:
-            print(f"第三方接入查询: HTTP {r2.status_code} {r2.text[:120]}")
-    except Exception as e:
-        print(f"第三方接入查询异常: {type(e).__name__} {str(e)[:100]}")
+            print(f"第三方接入[{url2.split('/')[2]}{url2.split('/')[3][:28]}]: HTTP 200 但无条目")
+    if "third_party" not in out:
+        print("  （所有候选路径均未返回绑定信息）")
 
     # ---------- 3. 各设备源的当日步数（多设备冲突排查） ----------
     # 账号下若绑了多个设备，微信运动取的是"最高值"数据源，
@@ -835,7 +881,10 @@ def diagnose_sync(app_token, userid) -> dict:
                 elif isinstance(sm, dict):
                     ttl = (sm.get("stp") or {}).get("ttl")
                 src = it.get("source", it.get("src", "?"))
+                # 完整打印条目，便于人工确认设备ID/日期等字段的真实名称
+                brief = {k: v for k, v in it.items() if k != "summary"}
                 print(f"  设备 {did}: 步数={ttl} source={src} date={it.get('date')}")
+                print(f"    条目全字段: {json.dumps(brief, ensure_ascii=False)[:300]}")
             out["device_sources"] = its
         else:
             print(f"设备源步数明细: HTTP {r3.status_code}")
