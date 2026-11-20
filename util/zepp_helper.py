@@ -242,20 +242,32 @@ def renew_login_token(login_token) -> (str | None, str | None):
 
 
 def _extract_items(resp) -> list:
-    """从华米响应中提取设备列表。
+    """从华米响应中提取设备/数据列表。
 
     华米 API 的业务数据通常在 data 字段下（如 {"code":0,"message":"success","data":{"items":[...]}}），
-    但不同接口/版本层级并不一致，这里做多层级兼容，避免永远取到空列表。
+    但不同接口/版本层级并不一致：
+      - data 可能是 dict（内含 items/list/devices/bands）
+      - data 也可能直接就是 list
+    这里做多层级兼容，避免永远取到空列表或类型异常。
     """
     if not isinstance(resp, dict):
         return []
-    # 依次尝试：顶层 -> data -> data.data
-    for container in (resp, resp.get("data"), (resp.get("data") or {}).get("data")):
-        if isinstance(container, dict):
-            for key in ("items", "list", "devices", "bands"):
-                val = container.get(key)
-                if isinstance(val, list) and val:
-                    return val
+    # data 可能不是 dict，先做类型防御
+    data = resp.get("data")
+    containers = [resp]
+    if isinstance(data, dict):
+        containers.append(data)
+        inner = data.get("data")
+        if isinstance(inner, dict):
+            containers.append(inner)
+    for container in containers:
+        for key in ("items", "list", "devices", "bands"):
+            val = container.get(key)
+            if isinstance(val, list) and val:
+                return val
+    # data 本身就是列表的情况
+    if isinstance(data, list) and data:
+        return data
     return []
 
 
@@ -537,7 +549,7 @@ def read_back_steps(app_token, userid, device_id=None, date=None) -> dict | None
         print(f"云端回读异常: {type(e).__name__} {str(e)[:100]}")
         return None
 
-    items = j.get("items") or (j.get("data") or {}).get("items") or []
+    items = _extract_items(j)
     if not items:
         print(f"云端回读：{date} 无数据项（数据可能尚未入库）")
         return None
