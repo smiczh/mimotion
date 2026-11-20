@@ -1230,19 +1230,30 @@ def _build_submit_attempts(base_url, base_head, app_token, compat=None):
         hosts.insert(0, ("cn2", "https://api-mifit-cn2.huami.com"))
 
     attempts = []
-    # 1) 原样（精简 header）+ 原域名 —— 保持原有行为，第一个就试
+    # 1) 首选：cn 域名 + 完整手机 App 请求头
+    #    【已实测可用】Web 签发的 app_token 必须搭配手机 App 的身份请求头，
+    #    否则 band_data 接口返回 500（-50000 Failed to process the request）。
+    #    参考 amazfit-mcp：数据调用用 Android-app header 身份，
+    #    即使 token 是 web-app 签发的也能被接受。
+    cn_host = "https://api-mifit-cn.huami.com"
+    attempts.append(("cn+app头",
+                     f"{cn_host}/v1/data/band_data.json?&t={t}&r={uuid.uuid4()}",
+                     mk(app_data_head)))
+    # 2) 原样（精简 header）+ 原域名 —— 兼容手机身份签发的 token
     attempts.append(("原样", base_url, mk({})))
-    # 2) 补全手机 App header，各域名
+    # 3) 其余域名 + 完整 App header（备用）
     for tag, host in hosts:
+        if host == cn_host:
+            continue
         attempts.append((f"{tag}+app头",
                          f"{host}/v1/data/band_data.json?&t={t}&r={uuid.uuid4()}",
                          mk(app_data_head)))
-    # 3) midong 身份头
+    # 4) midong 身份头
     attempts.append(("zepp+midong头",
-                     f"https://api-mifit.zepp.com/v1/data/band_data.json?&t={t}&r={uuid.uuid4()}",
+                     "https://api-mifit.zepp.com/v1/data/band_data.json?&t={t}&r={uuid.uuid4()}",
                      mk(midong_head)))
-    # 4) Web 身份头
+    # 5) Web 身份头
     attempts.append(("zepp+web头",
-                     f"https://api-mifit.zepp.com/v1/data/band_data.json?&t={t}&r={uuid.uuid4()}",
+                     "https://api-mifit.zepp.com/v1/data/band_data.json?&t={t}&r={uuid.uuid4()}",
                      mk(web_head)))
     return attempts
