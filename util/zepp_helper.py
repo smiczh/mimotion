@@ -473,11 +473,17 @@ def _sync_summary_with_step(data_json: str, target_step: int) -> str:
         return data_json
 
 
-def _compat_flags() -> dict:
-    """读取兼容模式开关（来自 CONFIG 的 COMPAT_* 字段或环境变量）。
+def _compat_flags(cfg=None) -> dict:
+    """读取兼容模式开关。
 
-    用于对照实验：逐项对齐 Zepp-Life-Steps 的提交格式，
-    定位"脚本返回 success 但微信不更新"的真正阻塞点。
+    只认环境变量（由 GitHub Actions 的 workflow_dispatch input 注入）：
+      COMPAT_STAGE_EMPTY / COMPAT_CURRENT_TS / COMPAT_NO_DEVID / COMPAT_CN2
+
+    【重要】刻意不读 CONFIG 里的同名字段：
+    1) 定时任务不传这些环境变量，若 CONFIG 里留了开关，定时任务会一直用兼容模式跑；
+    2) COMPAT_NO_DEVID 会让数据写进原作者的设备 DA932FFFFE8816E7，绝不能长期开着；
+    3) 改 Secret 容易漏保存/格式错（实测连续两次"兼容模式全部关闭"）。
+    因此兼容模式只在手动 Run workflow 时通过输入框临时开启。
     """
     flags = {
         "stage_empty": False,
@@ -485,7 +491,6 @@ def _compat_flags() -> dict:
         "no_devid": False,
         "cn2": False,
     }
-    # 环境变量优先（便于临时试验，不改 CONFIG）
     env_map = {
         "COMPAT_STAGE_EMPTY": "stage_empty",
         "COMPAT_CURRENT_TS": "current_ts",
@@ -496,16 +501,14 @@ def _compat_flags() -> dict:
         val = os.environ.get(env_key, "").strip().lower()
         if val in ("1", "true", "yes", "on"):
             flags[flag] = True
-    # CONFIG 字段（COMPAT_STAGE_EMPTY 等）
-    try:
-        cfg = globals().get("config")
-        if isinstance(cfg, dict):
-            for env_key, flag in env_map.items():
-                val = str(cfg.get(env_key, "")).strip().lower()
-                if val in ("1", "true", "yes", "on"):
-                    flags[flag] = True
-    except Exception:
-        pass
+
+    # 若 CONFIG 里还残留 COMPAT_* 字段，提示用户删除（它们已不再生效）
+    if isinstance(cfg, dict):
+        leftover = [k for k in cfg.keys()
+                    if isinstance(k, str) and k.upper().startswith("COMPAT_")]
+        if leftover:
+            print(f"提示: CONFIG 中的 {leftover} 已不再生效（兼容模式只认 Actions 输入参数），"
+                  f"建议从 CONFIG Secret 里删除，避免误以为已开启")
     return flags
 
 
@@ -529,7 +532,7 @@ def _clear_stage(data_json: str) -> str:
         return data_json
 
 
-def post_fake_brand_data(step, app_token, userid, device_id=None):
+def post_fake_brand_data(step, app_token, userid, device_id=None, cfg=None):
     t = get_time()
 
     # 提交日期必须用北京时间：GitHub Actions的runner是UTC时区，跨北京时间0点执行时UTC日期还是前一天，会把步数写错天
@@ -554,7 +557,7 @@ def post_fake_brand_data(step, app_token, userid, device_id=None):
     #   compat_current_ts  : last_sync_data_time 用当前时间戳（参考实现如此，我们原为固定的 2020 年值）
     #   compat_no_devid    : 不替换 did，保持模板自带的 DA932FFFFE8816E7
     #   compat_cn2         : 提交到 api-mifit-cn2.huami.com（参考实现用的域名）
-    compat = _compat_flags()
+    compat = _compat_flags(cfg)
     if compat.get("stage_empty"):
         data_json = _clear_stage(data_json)
     if compat.get("no_devid"):
