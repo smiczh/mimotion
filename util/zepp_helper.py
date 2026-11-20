@@ -616,11 +616,48 @@ def post_fake_brand_data(step, app_token, userid, device_id=None, cfg=None):
               + (f" | last_sync_data_time={sync_time}" if compat.get("current_ts") else "")
               + (f" | 域名={'cn2' if compat.get('cn2') else 'cn'}"))
 
-    response = requests.post(url, data=data, headers=head)
-    if response.status_code != 200:
-        return False, "请求修改步数异常：%d" % response.status_code
-    response = response.json()
-    message = response["message"]
+    # 提交尝试：依次尝试多个「域名 × 请求头」组合，任一成功即返回。
+    # Web 身份登录拿到的 app_token 提交数据时可能因请求头身份不匹配而报 500，
+    # 这里多试几种组合，一次运行即可定位可用组合。
+    attempts = _build_submit_attempts(url, head, app_token, compat)
+    last_err = None
+    for idx, (label, a_url, a_head) in enumerate(attempts):
+        try:
+            response = requests.post(a_url, data=data, headers=a_head, timeout=20)
+        except Exception as e:
+            last_err = f"{label}: 请求异常 {type(e).__name__}"
+            print(f"  提交尝试[{label}]: 异常 {type(e).__name__} {str(e)[:80]}")
+            continue
+        if response.status_code != 200:
+            body = response.text[:200].replace("\n", " ")
+            last_err = f"{label}: HTTP {response.status_code} {body}"
+            print(f"  提交尝试[{label}]: HTTP {response.status_code} | {body[:120]}")
+            continue
+        try:
+            j = response.json()
+        except Exception:
+            last_err = f"{label}: 响应非JSON"
+            print(f"  提交尝试[{label}]: 响应非JSON | {response.text[:120]}")
+            continue
+        msg = j.get("message", "")
+        if msg == "success":
+            if idx > 0:
+                print(f"  ✓ 提交成功于组合: {label}")
+            return True, msg
+        last_err = f"{label}: {msg}"
+        print(f"  提交尝试[{label}]: {msg}")
+
+    print(f"提交失败，所有组合均未成功。最后错误: {last_err}")
+    print(f"  URL基准: {url}")
+    print(f"  userid={userid} last_deviceid={target_dev_id} "
+          f"device_type=0 sync_time={sync_time} data_json长度={len(data_json)}")
+    print(f"  app_token前16位: {str(app_token)[:16]}")
+    return False, "请求修改步数异常（已尝试%d种组合）：%s" % (len(attempts), str(last_err)[:100])
+    try:
+        response = response.json()
+    except Exception:
+        return False, "响应非JSON：%s" % response.text[:120]
+    message = response.get("message", "")
     if message == "success":
         return True, message
     else:
@@ -1131,3 +1168,81 @@ def renew_login_token_web(login_token) -> (str | None, str | None):
             return None, f"请求失败：{result}"
         return None, f"响应中无login_token：{str(body)[:150]}"
     return login_token_new, None
+
+
+def _build_submit_attempts(base_url, base_head, app_token, compat=None):
+    """构造提交步数的「域名 × 请求头」组合列表。
+
+    Web 身份登录拿到的 app_token 在提交 band_data 时可能报 500，
+    原因是请求头里的身份标识（appname/appplatform）与 token 的签发身份不匹配。
+    参考 amazfit-mcp 的做法：数据调用用【手机 App 的 header 身份】，
+    即使 token 是 Web 签发的也能被接受。
+
+    这里依次尝试若干组合，任一成功即可，全程打印尝试结果便于定位。
+    """
+    compat = compat or {}
+
+    # 手机 App 身份的数据请求头（国内配置）
+    app_data_head = {
+        "hm-privacy-diagnostics": "false",
+        "country": "CN",
+        "appplatform": "android_phone",
+        "hm-privacy-ceip": "true",
+        "timezone": "Asia/Shanghai",
+        "channel": "a100900101016",
+        "vb": "202509151347",
+        "cv": "50818_6.14.0",
+        "appname": "com.xiaomi.hm.health",
+        "v": "2.0",
+        "lang": "zh_CN",
+        "user-agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)",
+        "accept-encoding": "gzip",
+    }
+    # 另一种 App 身份标识（部分接口认 com.huami.midong）
+    midong_head = dict(app_data_head)
+    midong_head["appname"] = "com.huami.midong"
+    midong_head["user-agent"] = "Zepp/9.12.5 (Pixel 4; Android 12; Density/2.75)"
+    # Web 身份请求头
+    web_head = {
+        "country": "CN",
+        "appplatform": "web",
+        "appname": WEB_APP_NAME,
+        "app_name": WEB_APP_NAME,
+        "origin": "https://user.zepp.com",
+        "referer": "https://user.zepp.com/",
+        "user-agent": WEB_UA,
+        "accept-encoding": "gzip",
+    }
+
+    def mk(head_extra):
+        h = dict(base_head)
+        h.update(head_extra)
+        h["apptoken"] = app_token
+        return h
+
+    t = get_time()
+    hosts = [
+        ("cn", "https://api-mifit-cn.huami.com"),
+        ("zepp", "https://api-mifit.zepp.com"),
+        ("cn3", "https://api-mifit-cn3.zepp.com"),
+    ]
+    if compat.get("cn2"):
+        hosts.insert(0, ("cn2", "https://api-mifit-cn2.huami.com"))
+
+    attempts = []
+    # 1) 原样（精简 header）+ 原域名 —— 保持原有行为，第一个就试
+    attempts.append(("原样", base_url, mk({})))
+    # 2) 补全手机 App header，各域名
+    for tag, host in hosts:
+        attempts.append((f"{tag}+app头",
+                         f"{host}/v1/data/band_data.json?&t={t}&r={uuid.uuid4()}",
+                         mk(app_data_head)))
+    # 3) midong 身份头
+    attempts.append(("zepp+midong头",
+                     f"https://api-mifit.zepp.com/v1/data/band_data.json?&t={t}&r={uuid.uuid4()}",
+                     mk(midong_head)))
+    # 4) Web 身份头
+    attempts.append(("zepp+web头",
+                     f"https://api-mifit.zepp.com/v1/data/band_data.json?&t={t}&r={uuid.uuid4()}",
+                     mk(web_head)))
+    return attempts

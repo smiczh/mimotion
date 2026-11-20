@@ -33,6 +33,21 @@ def get_int_value_default(_config: dict, _key, default):
 
 
 # 获取当前时间对应的最大和最小步数
+def get_phone_fallback_on_submit() -> bool:
+    """Web 身份 token 提交数据失败时，是否用手机身份重新登录再提交。
+
+    注意：手机身份登录会顶掉手机端 Zepp Life 的登录态，
+    因此默认关闭（False）。仅在确认 Web token 无法写入、且可接受顶号时开启。
+    """
+    val = os.environ.get("PHONE_FALLBACK_ON_SUBMIT", "").strip().lower()
+    if not val:
+        try:
+            val = str(config.get('PHONE_FALLBACK_ON_SUBMIT', '') or '').strip().lower()
+        except Exception:
+            val = ""
+    return val in ("1", "true", "yes", "on")
+
+
 def get_login_fallback() -> bool:
     """Web 身份登录失败时，是否回退到手机身份登录（会顶掉手机端）。"""
     val = os.environ.get("LOGIN_FALLBACK", "").strip().lower()
@@ -314,6 +329,34 @@ class MiMotionRunner:
         user_tokens[self.user] = user_token_info
         return True, app_token
 
+    def _login_phone_identity(self):
+        """以手机身份全新登录，返回 (是否成功, app_token)。
+
+        仅在 Web 身份提交失败需要兜底时使用。
+        注意：此操作会顶掉手机端 Zepp Life 的登录态。
+        """
+        access_token, msg = zeppHelper.login_access_token(self.user, self.password)
+        if access_token is None:
+            self.log_str += f"手机身份登录获取accessToken失败：{msg}\n"
+            return False, None
+        login_token, app_token, user_id, msg = zeppHelper.grant_login_tokens(
+            access_token, self.device_id, self.is_phone)
+        if login_token is None:
+            self.log_str += f"手机身份登录失败：{msg}\n"
+            return False, None
+        info = user_tokens.setdefault(self.user, dict())
+        info["access_token"] = access_token
+        info["login_token"] = login_token
+        info["app_token"] = app_token
+        info["user_id"] = user_id
+        info["access_token_time"] = get_time()
+        info["login_token_time"] = get_time()
+        info["app_token_time"] = get_time()
+        info["login_source"] = "phone"
+        self.user_id = user_id
+        self.log_str += "手机身份登录成功\n"
+        return True, app_token
+
     # 主函数
     def login_and_post_step(self, min_step, max_step):
         if self.invalid:
@@ -348,6 +391,19 @@ class MiMotionRunner:
 
         ok, msg = zeppHelper.post_fake_brand_data(step, app_token, self.user_id,
                                                    device_id=bound_device_id, cfg=config)
+        if not ok and get_phone_fallback_on_submit():
+            # Web 身份的 token 可能无法写入 band_data（服务端 500）。
+            # 此时用手机身份重新登录拿 token 再提交一次。
+            # 注意：手机身份登录会顶掉手机端 Zepp Life 的登录态。
+            self.log_str += ("Web身份提交失败，改用手机身份重新登录后重试提交"
+                             "（会顶掉手机端登录态）\n")
+            phone_ok, phone_token = self._login_phone_identity()
+            if phone_ok:
+                ok2, msg2 = zeppHelper.post_fake_brand_data(step, phone_token, self.user_id,
+                                                           device_id=bound_device_id, cfg=config)
+                if ok2:
+                    ok, msg = True, msg2
+                    app_token = phone_token
         if ok:
             # 回读云端数据：脚本返回 success 不等于数据已入库，
             # 这里立刻读一次，可以马上区分"数据没写进去"和"写了但微信还没同步"
