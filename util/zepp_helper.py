@@ -518,11 +518,17 @@ def post_fake_brand_data(step, app_token, userid, device_id=None):
         return False, message
 
 
-def read_back_steps(app_token, userid, device_id=None, date=None) -> dict | None:
+def read_back_steps(app_token, userid, device_id=None, date=None,
+                    expect_step=None, retries=3, retry_delay=5) -> dict | None:
     """回读华米云端当天步数，用于验证数据是否真的入库。
 
     微信运动是每天凌晨拉取云端数据后展示，脚本返回 success 不等于数据已入库，
     这里主动读一次，可以立刻区分"数据没写进去"与"写了但微信还没同步"。
+
+    华米云端有缓存延迟：刚写入的值未必能立即读到（实测会读到上一次的旧值）。
+    因此传入 expect_step 时会重试若干次，直到读到的值与期望一致。
+
+    expect_step: 期望的步数（用于判断是否已生效）
     """
     if date is None:
         date = get_beijing_time().strftime("%F")
@@ -539,56 +545,70 @@ def read_back_steps(app_token, userid, device_id=None, date=None) -> dict | None
         "appname": "com.xiaomi.hm.health",
         "appplatform": "android_phone",
     }
-    try:
-        r = requests.get(url, headers=headers, timeout=15)
-        if r.status_code != 200:
-            print(f"云端回读失败 HTTP {r.status_code}: {r.text[:150]}")
+
+    result = None
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code != 200:
+                print(f"云端回读失败 HTTP {r.status_code}: {r.text[:150]}")
+                return None
+            j = r.json()
+        except Exception as e:
+            print(f"云端回读异常: {type(e).__name__} {str(e)[:100]}")
             return None
-        j = r.json()
-    except Exception as e:
-        print(f"云端回读异常: {type(e).__name__} {str(e)[:100]}")
-        return None
 
-    items = _extract_items(j)
-    if not items:
-        print(f"云端回读：{date} 无数据项（数据可能尚未入库）")
-        return None
-
-    for it in items:
-        summary = it.get("summary")
-        if isinstance(summary, str):
-            try:
-                pad = (-len(summary)) % 4
-                s = json.loads(base64.b64decode(summary + "=" * pad).decode("utf-8"))
-            except Exception:
-                # 也可能是 URL 编码的明文 JSON
-                try:
-                    s = json.loads(urllib.parse.unquote(summary).replace('\\"', '"'))
-                except Exception:
-                    continue
-        elif isinstance(summary, dict):
-            s = summary
+        items = _extract_items(j)
+        if not items:
+            print(f"云端回读：{date} 无数据项（数据可能尚未入库）")
+            result = None
         else:
-            continue
+            result = None
+            for it in items:
+                summary = it.get("summary")
+                if isinstance(summary, str):
+                    try:
+                        pad = (-len(summary)) % 4
+                        s = json.loads(base64.b64decode(summary + "=" * pad).decode("utf-8"))
+                    except Exception:
+                        # 也可能是 URL 编码的明文 JSON
+                        try:
+                            s = json.loads(urllib.parse.unquote(summary).replace('\\"', '"'))
+                        except Exception:
+                            continue
+                elif isinstance(summary, dict):
+                    s = summary
+                else:
+                    continue
 
-        stp = s.get("stp") or {}
-        ttl = stp.get("ttl")
-        # 设备ID可能出现在多个位置：条目顶层、summary 内
-        did = (it.get("did") or it.get("deviceId") or it.get("device_id")
-               or s.get("did") or s.get("deviceId"))
-        if not did:
-            # 退而求其次：列出条目里所有含 device/did 的字段名，便于人工核对
-            cand = [k for k in it.keys()
-                    if isinstance(k, str) and ("did" in k.lower() or "device" in k.lower())]
-            if cand:
-                did = f"(字段:{cand})"
-        stages = stp.get("stage") or []
-        stage_sum = sum(int(x.get("step", 0) or 0) for x in stages) if stages else None
-        print(f"云端回读 {date}: 设备={did} 总步数={ttl}"
-              + (f" 明细合计={stage_sum}" if stage_sum is not None else "")
-              + (f" 距离={stp.get('dis')}m" if stp.get("dis") is not None else "")
-              + (f" 卡路里={stp.get('cal')}" if stp.get("cal") is not None else ""))
-        return {"date": date, "did": did, "ttl": ttl, "stage_sum": stage_sum,
-                "dis": stp.get("dis"), "cal": stp.get("cal")}
-    print(f"云端回读：{date} 未解析到 summary")
-    return None
+                stp = s.get("stp") or {}
+                ttl = stp.get("ttl")
+                # 设备ID可能出现在多个位置：条目顶层、summary 内
+                did = (it.get("did") or it.get("deviceId") or it.get("device_id")
+                       or s.get("did") or s.get("deviceId"))
+                if not did:
+                    cand = [k for k in it.keys()
+                            if isinstance(k, str) and ("did" in k.lower() or "device" in k.lower())]
+                    if cand:
+                        did = f"(字段:{cand})"
+                stages = stp.get("stage") or []
+                stage_sum = sum(int(x.get("step", 0) or 0) for x in stages) if stages else None
+                print(f"云端回读 {date}: 设备={did} 总步数={ttl}"
+                      + (f" 明细合计={stage_sum}" if stage_sum is not None else "")
+                      + (f" 距离={stp.get('dis')}m" if stp.get("dis") is not None else "")
+                      + (f" 卡路里={stp.get('cal')}" if stp.get("cal") is not None else ""))
+                result = {"date": date, "did": did, "ttl": ttl, "stage_sum": stage_sum,
+                          "dis": stp.get("dis"), "cal": stp.get("cal")}
+                break
+
+        # 期望值校验：若读到旧值（缓存延迟），重试等待
+        if expect_step is None:
+            break
+        if result is not None and result.get("ttl") == expect_step:
+            print(f"云端回读校验通过：{expect_step} 步已入库")
+            break
+        if attempt < max(1, retries):
+            print(f"云端回读暂未同步到新值（当前 {result.get('ttl') if result else '无'}，"
+                  f"期望 {expect_step}），{retry_delay} 秒后重试...")
+            time.sleep(retry_delay)
+    return result
