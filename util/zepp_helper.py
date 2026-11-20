@@ -250,6 +250,10 @@ def get_user_device_id(app_token, userid) -> str | None:
     try:
         resp = requests.get(url, headers=headers, timeout=5).json()
         items = resp.get("items", [])
+        if not items:
+            # 账号未绑定任何设备，明确提示，避免静默使用他人设备ID
+            print("未绑定任何设备：账号下无设备列表，请先在 Zepp Life 绑定手环或虚拟设备")
+            return None
         if items:
             # 1. 优先匹配 deviceType == 0 (手环/手表)
             for item in items:
@@ -264,6 +268,11 @@ def get_user_device_id(app_token, userid) -> str | None:
                     dev_id = item.get("deviceId") or item.get("mac")
                     if dev_id:
                         return str(dev_id).replace(":", "").upper()
+            # 3. 兜底：取任意一个带 deviceId/mac 的条目，避免写入他人的默认设备
+            for item in items:
+                dev_id = item.get("deviceId") or item.get("mac")
+                if dev_id:
+                    return str(dev_id).replace(":", "").upper()
     except Exception as e:
         print(f"查询设备列表异常: {e}")
     return None
@@ -291,6 +300,11 @@ def post_fake_brand_data(step, app_token, userid, device_id=None):
     target_dev_id = device_id if device_id else "DA932FFFFE8816E7"
     if device_id:
         data_json = str(data_json).replace("DA932FFFFE8816E7", target_dev_id)
+    else:
+        # 没有拿到本账号真实绑定的设备ID时，绝不能写入默认设备ID
+        # （那是原作者的设备，会导致"接口返回成功但自己账号步数不变"）
+        print("未获取到本账号的设备ID，跳过提交（否则步数不会写入你的账号）")
+        return False, "未绑定设备：请先在 Zepp Life 绑定手环或虚拟设备后重试"
 
     data = f'userid={userid}&last_sync_data_time=1597306380&device_type=0&last_deviceid={target_dev_id}&data_json={data_json}'
 

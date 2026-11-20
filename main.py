@@ -21,6 +21,11 @@ try:
 except ImportError:
     pass
 
+# 固定 device_id（可选）
+# 通过环境变量 DEVICE_ID 或 CONFIG 中的 DEVICE_ID 指定。
+# 留空则每次运行生成随机 device_id（会导致华米视为新设备登录，顶掉手机端登录态）
+FIXED_DEVICE_ID = os.environ.get("DEVICE_ID", "").strip()
+
 # 获取默认值转int
 def get_int_value_default(_config: dict, _key, default):
     _config.setdefault(_key, default)
@@ -91,7 +96,7 @@ def get_error_code(location):
 class MiMotionRunner:
     def __init__(self, _user, _passwd):
         self.user_id = None
-        self.device_id = str(uuid.uuid4())
+        self.device_id = FIXED_DEVICE_ID if FIXED_DEVICE_ID else str(uuid.uuid4())
         user = str(_user)
         password = str(_passwd)
         self.invalid = False
@@ -326,6 +331,11 @@ if __name__ == "__main__":
     else:
         print("未配置CONFIG或USER/PWD环境变量，无法执行。请在本地创建.env文件或配置环境变量。")
         exit(1)
+
+    # CONFIG 中的 DEVICE_ID 优先于环境变量
+    _cfg_dev = str(config.get('DEVICE_ID', '') or '').strip()
+    if _cfg_dev:
+        FIXED_DEVICE_ID = _cfg_dev
 
     # region 初始化参数
     # 创建推送配置对象
