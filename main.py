@@ -33,6 +33,41 @@ def get_int_value_default(_config: dict, _key, default):
 
 
 # 获取当前时间对应的最大和最小步数
+def get_login_fallback() -> bool:
+    """Web 身份登录失败时，是否回退到手机身份登录（会顶掉手机端）。"""
+    val = os.environ.get("LOGIN_FALLBACK", "").strip().lower()
+    if not val:
+        try:
+            val = str(config.get('LOGIN_FALLBACK', '') or '').strip().lower()
+        except Exception:
+            val = ""
+    return val in ("1", "true", "yes", "on")
+
+
+def get_login_mode() -> str:
+    """登录方式：web（默认，不顶掉手机端） / phone（旧的安卓手机身份）。"""
+    val = os.environ.get("LOGIN_MODE", "").strip().lower()
+    if not val:
+        try:
+            val = str(config.get('LOGIN_MODE', '') or '').strip().lower()
+        except Exception:
+            val = ""
+    if val in ("phone", "app", "android"):
+        return "phone"
+    return "web"
+
+
+def get_country_code() -> str:
+    """国家码，默认 CN。"""
+    val = os.environ.get("COUNTRY_CODE", "").strip()
+    if not val:
+        try:
+            val = str(config.get('COUNTRY_CODE', '') or '').strip()
+        except Exception:
+            val = ""
+    return val or "CN"
+
+
 def get_min_max_by_time(hour=None, minute=None):
     if hour is None:
         hour = time_bj.hour
@@ -168,19 +203,32 @@ class MiMotionRunner:
                 # 检查login_token是否可用
                 app_token, msg = zeppHelper.grant_app_token(login_token)
                 if app_token is None:
-                    self.log_str += f"login_token 失效 重新获取 last grant time: {user_token_info.get('login_token_time')}\n"
-                    login_token, app_token, user_id, msg = zeppHelper.grant_login_tokens(access_token, self.device_id,
-                                                                                         self.is_phone)
-                    if login_token is None:
-                        self.log_str += f"access_token 已失效：{msg} last grant time:{user_token_info.get('access_token_time')}\n"
-                    else:
-                        user_token_info["login_token"] = login_token
-                        user_token_info["app_token"] = app_token
-                        user_token_info["user_id"] = user_id
+                    # login_token 也失效了。先尝试【续期】而不是全新登录——
+                    # renew_login_token 只延长现有会话，不会创建新会话，
+                    # 因此不会把手机端 Zepp Life 的登录态顶掉。
+                    # 只有续期也失败，才用账号密码全新登录（这一步必然会顶号）。
+                    self.log_str += f"login_token 失效 尝试续期（不新建会话，避免顶掉手机端）\n"
+                    new_login_token, renew_msg = zeppHelper.renew_login_token(login_token)
+                    if new_login_token:
+                        user_token_info["login_token"] = new_login_token
                         user_token_info["login_token_time"] = get_time()
-                        user_token_info["app_token_time"] = get_time()
-                        self.user_id = user_id
-                        return app_token
+                        login_token = new_login_token
+                        app_token, msg = zeppHelper.grant_app_token(login_token)
+                        if app_token:
+                            user_token_info["app_token"] = app_token
+                            user_token_info["app_token_time"] = get_time()
+                            self.log_str += "login_token续期成功，重新获取app_token成功（未新建会话）\n"
+                            return app_token
+                        self.log_str += f"续期后仍无法获取app_token：{msg}\n"
+                    else:
+                        self.log_str += f"login_token续期失败：{renew_msg}\n"
+                    # 续期也失败，走【Web 身份】全新登录（不会顶掉手机端）
+                    self.log_str += "改为Web身份全新登录（不顶掉手机端登录态）\n"
+                    ok_login, new_app_token = self._fresh_login()
+                    if ok_login:
+                        return new_app_token
+                    return None
+
                 else:
                     self.log_str += "重新获取app_token成功\n"
                     user_token_info["app_token"] = app_token
@@ -188,16 +236,51 @@ class MiMotionRunner:
                     return app_token
 
         # access_token 失效 或者没有保存加密数据
+        ok_login, app_token = self._fresh_login()
+        if not ok_login:
+            return None
+        return app_token
+
+    def _fresh_login(self):
+        """全新登录。优先用 Web 身份（不顶掉手机端 Zepp Life）。
+
+        返回 (是否成功, app_token 或错误信息)。
+        """
+        mode = get_login_mode()
+        self.log_str += f"全新登录方式: {mode}\n"
+
+        if mode == "web":
+            # Web 身份：华米侧视为网页端会话，与手机 App 会话互不干扰
+            app_token, login_token, user_id, err = zeppHelper.login_web_tokens(
+                self.user, self.password, country_code=get_country_code())
+            if app_token:
+                info = user_tokens.setdefault(self.user, dict())
+                info["app_token"] = app_token
+                info["login_token"] = login_token
+                info["user_id"] = user_id
+                info["app_token_time"] = get_time()
+                info["login_token_time"] = get_time()
+                if info.get("device_id") is None:
+                    info["device_id"] = self.device_id
+                self.user_id = user_id
+                self.log_str += "Web身份登录成功（不影响手机端登录态）\n"
+                return True, app_token
+            self.log_str += f"Web身份登录失败：{err}\n"
+            if not get_login_fallback():
+                return False, None
+            self.log_str += "回退到手机身份登录（可能顶掉手机端登录态）\n"
+
+        # 原有手机身份流程（兜底）
         access_token, msg = zeppHelper.login_access_token(self.user, self.password)
         if access_token is None:
             self.log_str += "登录获取accessToken失败：%s" % msg
-            return None
+            return False, None
         # print(f"device_id:{self.device_id} isPhone: {self.is_phone}")
         login_token, app_token, user_id, msg = zeppHelper.grant_login_tokens(access_token, self.device_id,
                                                                              self.is_phone)
         if login_token is None:
             self.log_str += f"登录提取的 access_token 无效：{msg}"
-            return None
+            return False, None
 
         user_token_info = dict()
         user_token_info["access_token"] = access_token
@@ -215,7 +298,7 @@ class MiMotionRunner:
             self.device_id = uuid.uuid4()
         user_token_info["device_id"] = self.device_id
         user_tokens[self.user] = user_token_info
-        return app_token
+        return True, app_token
 
     # 主函数
     def login_and_post_step(self, min_step, max_step):

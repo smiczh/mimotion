@@ -942,3 +942,119 @@ def diagnose_sync(app_token, userid) -> dict:
         print(f"设备源步数明细异常: {type(e).__name__} {str(e)[:100]}")
 
     return out
+
+
+# ============================================================================
+# Web 身份登录（不顶掉手机端 Zepp Life）
+#
+# 顶号的根因：原实现以【安卓手机身份】登录
+#   app_name=com.xiaomi.hm.health, device_model=android_phone
+# 华米侧把同一账号的会话与手机 App 绑定，脚本每次全新登录都会把手机端挤下线。
+#
+# 解决方案：改用【Web 身份】登录（与 user.zepp.com 网页端同一套流程）：
+#   app_name=com.huami.webapp, device_model=web, device_id=web_<uuid>
+#   配合 origin/referer=https://user.zepp.com
+# 这样脚本会话与手机 App 会话相互独立，不会互相顶号。
+# 参考实现：amazfit-mcp / zepp-downloader 的 web-app 登录流程。
+# ============================================================================
+
+WEB_APP_NAME = "com.huami.webapp"
+WEB_REDIRECT_URI = "https://s3-us-west-2.amazonaws.com/hm-registration/successsignin.html"
+WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+WEB_DN = "api-mifit.zepp.com,api-user.zepp.com,api-watch.zepp.com,auth.zepp.com"
+
+
+def login_web_tokens(user, password, country_code="CN"):
+    """以 Web 身份登录，返回 (app_token, login_token, user_id, error)。
+
+    流程（三步）：
+      1. POST api-user.huami.com/registrations/{email}/tokens  -> 拿 access code
+      2. POST api-mifit.zepp.com/v2/client/login                 -> 拿 login_token + user_id
+      3. GET  api-mifit.zepp.com/v1/client/app_tokens            -> 拿 app_token
+    """
+    try:
+        # ---- 1. 注册换取 access code ----
+        reg_headers = {
+            "app_name": WEB_APP_NAME,
+            "content-type": "application/x-www-form-urlencoded",
+            "origin": "https://user.zepp.com",
+            "referer": "https://user.zepp.com/",
+            "x-request-id": str(uuid.uuid4()),
+            "user-agent": WEB_UA,
+        }
+        reg_data = {
+            "client_id": "HuaMi",
+            "country_code": country_code,
+            "json_response": "true",
+            "name": user,
+            "password": password,
+            "redirect_uri": WEB_REDIRECT_URI,
+            "state": "REDIRECTION",
+            "token": "access",
+        }
+        r1 = requests.post(
+            f"https://api-user.huami.com/registrations/{urllib.parse.quote(user, safe='')}/tokens",
+            data=reg_data, headers=reg_headers, allow_redirects=False, timeout=20)
+
+        access_code = None
+        location = r1.headers.get("Location", "")
+        if location:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(location).query)
+            access_code = (qs.get("access") or [None])[0]
+        if not access_code and r1.status_code == 200:
+            try:
+                access_code = r1.json().get("access") or r1.json().get("code")
+            except Exception:
+                pass
+        if not access_code:
+            return None, None, None, f"Web登录失败(注册步骤) HTTP {r1.status_code}"
+
+        # ---- 2. access code 换 login_token + user_id ----
+        login_headers = {
+            "app_name": WEB_APP_NAME,
+            "appname": WEB_APP_NAME,
+            "appplatform": "web",
+            "origin": "https://user.zepp.com",
+            "referer": "https://user.zepp.com/",
+            "user-agent": WEB_UA,
+        }
+        login_data = {
+            "allow_registration": "false",
+            "app_name": WEB_APP_NAME,
+            "app_version": "1.0.0",
+            "code": access_code,
+            "country_code": country_code,
+            "device_id": f"web_{uuid.uuid4()}",
+            "device_model": "web",
+            "dn": WEB_DN,
+            "grant_type": "access_token",
+            "source": WEB_APP_NAME,
+            "third_name": "huami",
+        }
+        r2 = requests.post("https://api-mifit.zepp.com/v2/client/login",
+                           data=login_data, headers=login_headers, timeout=20)
+        try:
+            token_info = (r2.json() or {}).get("token_info") or {}
+        except Exception:
+            token_info = {}
+        login_token = token_info.get("login_token")
+        user_id = token_info.get("user_id")
+        if not login_token or not user_id:
+            return None, None, None, f"Web登录失败(换取token步骤) HTTP {r2.status_code}"
+
+        # ---- 3. login_token 换 app_token ----
+        r3 = requests.get(
+            "https://api-mifit.zepp.com/v1/client/app_tokens",
+            params={"app_name": WEB_APP_NAME, "dn": WEB_DN, "login_token": login_token},
+            headers=login_headers, timeout=20)
+        try:
+            app_token = ((r3.json() or {}).get("token_info") or {}).get("app_token")
+        except Exception:
+            app_token = None
+        if not app_token:
+            return None, None, None, f"Web登录失败(换取app_token步骤) HTTP {r3.status_code}"
+
+        return app_token, login_token, str(user_id), None
+    except Exception as e:
+        return None, None, None, f"Web登录异常: {type(e).__name__} {str(e)[:120]}"
