@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 import traceback
@@ -472,6 +473,62 @@ def _sync_summary_with_step(data_json: str, target_step: int) -> str:
         return data_json
 
 
+def _compat_flags() -> dict:
+    """读取兼容模式开关（来自 CONFIG 的 COMPAT_* 字段或环境变量）。
+
+    用于对照实验：逐项对齐 Zepp-Life-Steps 的提交格式，
+    定位"脚本返回 success 但微信不更新"的真正阻塞点。
+    """
+    flags = {
+        "stage_empty": False,
+        "current_ts": False,
+        "no_devid": False,
+        "cn2": False,
+    }
+    # 环境变量优先（便于临时试验，不改 CONFIG）
+    env_map = {
+        "COMPAT_STAGE_EMPTY": "stage_empty",
+        "COMPAT_CURRENT_TS": "current_ts",
+        "COMPAT_NO_DEVID": "no_devid",
+        "COMPAT_CN2": "cn2",
+    }
+    for env_key, flag in env_map.items():
+        val = os.environ.get(env_key, "").strip().lower()
+        if val in ("1", "true", "yes", "on"):
+            flags[flag] = True
+    # CONFIG 字段（COMPAT_STAGE_EMPTY 等）
+    try:
+        cfg = globals().get("config")
+        if isinstance(cfg, dict):
+            for env_key, flag in env_map.items():
+                val = str(cfg.get(env_key, "")).strip().lower()
+                if val in ("1", "true", "yes", "on"):
+                    flags[flag] = True
+    except Exception:
+        pass
+    return flags
+
+
+def _clear_stage(data_json: str) -> str:
+    """把 summary.stp.stage 置为空数组（对齐 Zepp-Life-Steps 的提交格式）。"""
+    try:
+        m = re.search(r'(%22summary%22%3A%22)(.*?)(%22(?:%2C|\"|,))', data_json, re.S)
+        if not m:
+            return data_json
+        raw = urllib.parse.unquote(m.group(2)).replace('\\"', '"')
+        summary = json.loads(raw)
+        stp = summary.get("stp")
+        if isinstance(stp, dict) and "stage" in stp:
+            stp["stage"] = []
+        new_raw = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        new_raw = new_raw.replace('"', '\\"')
+        new_raw = urllib.parse.quote(new_raw, safe="")
+        return data_json[:m.start(2)] + new_raw + data_json[m.end(2):]
+    except Exception as e:
+        print(f"清空 stage 失败（保留原值）: {e}")
+        return data_json
+
+
 def post_fake_brand_data(step, app_token, userid, device_id=None):
     t = get_time()
 
@@ -490,22 +547,48 @@ def post_fake_brand_data(step, app_token, userid, device_id=None):
     # 导致"总步数 18148"与"明细合计 23904"自相矛盾，
     # 华米侧校验判定数据异常，因而不会把数据推送给微信运动（脚本返回 success 但微信无变化）。
     data_json = _sync_summary_with_step(data_json, int(step))
-    url = f'https://api-mifit-cn.huami.com/v1/data/band_data.json?&t={t}&r={str(uuid.uuid4())}'
+
+    # 兼容模式：对齐 Zepp-Life-Steps（已验证可同步到微信）的提交格式。
+    # 该实现与我们的差异有 4 处，逐一可开关对比，用于定位真正的阻塞点：
+    #   compat_stage_empty : summary.stp.stage 置空（参考实现用 []，不带明细）
+    #   compat_current_ts  : last_sync_data_time 用当前时间戳（参考实现如此，我们原为固定的 2020 年值）
+    #   compat_no_devid    : 不替换 did，保持模板自带的 DA932FFFFE8816E7
+    #   compat_cn2         : 提交到 api-mifit-cn2.huami.com（参考实现用的域名）
+    compat = _compat_flags()
+    if compat.get("stage_empty"):
+        data_json = _clear_stage(data_json)
+    if compat.get("no_devid"):
+        # 参考实现不替换设备ID，保持模板原值
+        pass
+    else:
+        if device_id:
+            data_json = str(data_json).replace("DA932FFFFE8816E7", device_id)
+
+    if compat.get("cn2"):
+        url = f'https://api-mifit-cn2.huami.com/v1/data/band_data.json?&t={t}&r={str(uuid.uuid4())}'
+    else:
+        url = f'https://api-mifit-cn.huami.com/v1/data/band_data.json?&t={t}&r={str(uuid.uuid4())}'
     head = {
         "apptoken": app_token,
         "Content-Type": "application/x-www-form-urlencoded"
     }
 
-    target_dev_id = device_id if device_id else "DA932FFFFE8816E7"
-    if device_id:
-        data_json = str(data_json).replace("DA932FFFFE8816E7", target_dev_id)
-    else:
+    if not device_id and not compat.get("no_devid"):
         # 没有拿到本账号真实绑定的设备ID时，绝不能写入默认设备ID
         # （那是原作者的设备，会导致"接口返回成功但自己账号步数不变"）
         print("未获取到本账号的设备ID，跳过提交（否则步数不会写入你的账号）")
         return False, "未绑定设备：请先在 Zepp Life 绑定手环或虚拟设备后重试"
 
-    data = f'userid={userid}&last_sync_data_time=1597306380&device_type=0&last_deviceid={target_dev_id}&data_json={data_json}'
+    target_dev_id = "DA932FFFFE8816E7" if compat.get("no_devid") else (device_id or "DA932FFFFE8816E7")
+
+    sync_time = int(time.time()) if compat.get("current_ts") else 1597306380
+    data = f'userid={userid}&last_sync_data_time={sync_time}&device_type=0&last_deviceid={target_dev_id}&data_json={data_json}'
+
+    if compat:
+        on = [k for k, v in compat.items() if v]
+        print(f"兼容模式开启: {on if on else '全部关闭'}"
+              + (f" | last_sync_data_time={sync_time}" if compat.get("current_ts") else "")
+              + (f" | 域名={'cn2' if compat.get('cn2') else 'cn'}"))
 
     response = requests.post(url, data=data, headers=head)
     if response.status_code != 200:
