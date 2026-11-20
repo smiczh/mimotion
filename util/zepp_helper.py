@@ -573,12 +573,21 @@ def read_back_steps(app_token, userid, device_id=None, date=None) -> dict | None
 
         stp = s.get("stp") or {}
         ttl = stp.get("ttl")
-        did = it.get("did") or s.get("did")
+        # 设备ID可能出现在多个位置：条目顶层、summary 内
+        did = (it.get("did") or it.get("deviceId") or it.get("device_id")
+               or s.get("did") or s.get("deviceId"))
+        if not did:
+            # 退而求其次：列出条目里所有含 device/did 的字段名，便于人工核对
+            cand = [k for k in it.keys()
+                    if isinstance(k, str) and ("did" in k.lower() or "device" in k.lower())]
+            if cand:
+                did = f"(字段:{cand})"
         stages = stp.get("stage") or []
         stage_sum = sum(int(x.get("step", 0) or 0) for x in stages) if stages else None
         print(f"云端回读 {date}: 设备={did} 总步数={ttl}"
               + (f" 明细合计={stage_sum}" if stage_sum is not None else "")
-              + (f" 距离={stp.get('dis')}m" if stp.get("dis") is not None else ""))
+              + (f" 距离={stp.get('dis')}m" if stp.get("dis") is not None else "")
+              + (f" 卡路里={stp.get('cal')}" if stp.get("cal") is not None else ""))
         return {"date": date, "did": did, "ttl": ttl, "stage_sum": stage_sum,
                 "dis": stp.get("dis"), "cal": stp.get("cal")}
     print(f"云端回读：{date} 未解析到 summary")
