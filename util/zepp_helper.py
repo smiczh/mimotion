@@ -525,8 +525,8 @@ def read_back_steps(app_token, userid, device_id=None, date=None,
     微信运动是每天凌晨拉取云端数据后展示，脚本返回 success 不等于数据已入库，
     这里主动读一次，可以立刻区分"数据没写进去"与"写了但微信还没同步"。
 
-    华米云端有缓存延迟：刚写入的值未必能立即读到（实测会读到上一次的旧值）。
-    因此传入 expect_step 时会重试若干次，直到读到的值与期望一致。
+    华米对同一天的数据遵循"取最大值"规则：后写入的更小步数不会覆盖已有值。
+    因此传入 expect_step 时会重试若干次，直到云端值 >= 期望值（即数据确已入库）。
 
     expect_step: 期望的步数（用于判断是否已生效）
     """
@@ -601,14 +601,22 @@ def read_back_steps(app_token, userid, device_id=None, date=None,
                           "dis": stp.get("dis"), "cal": stp.get("cal")}
                 break
 
-        # 期望值校验：若读到旧值（缓存延迟），重试等待
+        # 期望值校验
+        # 注意：华米对同一天的数据遵循"取最大值"规则 —— 后写入的更小步数不会覆盖已有值。
+        # 因此只要云端值 >= 本次提交值，就说明数据已成功入库（可能是之前的某次运行写的）。
         if expect_step is None:
             break
-        if result is not None and result.get("ttl") == expect_step:
-            print(f"云端回读校验通过：{expect_step} 步已入库")
-            break
+        if result is not None and result.get("ttl") is not None:
+            cur = result.get("ttl")
+            if cur >= expect_step:
+                if cur == expect_step:
+                    print(f"云端回读校验通过：{expect_step} 步已入库")
+                else:
+                    print(f"云端回读校验通过：云端当前 {cur} 步 ≥ 本次提交 {expect_step} 步"
+                          f"（华米当日取最大值规则，更小的值不会覆盖）")
+                break
         if attempt < max(1, retries):
             print(f"云端回读暂未同步到新值（当前 {result.get('ttl') if result else '无'}，"
-                  f"期望 {expect_step}），{retry_delay} 秒后重试...")
+                  f"期望 ≥ {expect_step}），{retry_delay} 秒后重试...")
             time.sleep(retry_delay)
     return result
