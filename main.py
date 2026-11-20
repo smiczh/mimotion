@@ -175,6 +175,9 @@ class MiMotionRunner:
         user_token_info["login_token"] = login_token
         user_token_info["app_token"] = app_token
         user_token_info["user_id"] = user_id
+        # 关键：必须同步赋值给 self.user_id，
+        # 否则后续 get_user_device_id 会因 self.user_id 为 None 而被跳过，导致查不到设备
+        self.user_id = user_id
         # 记录token获取时间
         user_token_info["access_token_time"] = get_time()
         user_token_info["login_token_time"] = get_time()
@@ -198,12 +201,18 @@ class MiMotionRunner:
         
         user_token_info = user_tokens.get(self.user, {})
         bound_device_id = user_token_info.get("bound_device_id")
-        if not bound_device_id and self.user_id:
-            bound_device_id = zeppHelper.get_user_device_id(app_token, self.user_id)
-            if bound_device_id:
-                user_token_info["bound_device_id"] = bound_device_id
-                user_tokens[self.user] = user_token_info
-                self.log_str += f"查找到已绑定设备ID: {bound_device_id}\n"
+        if not bound_device_id:
+            if not self.user_id:
+                # user_id 缺失时无法查询设备，明确提示，避免静默跳过
+                self.log_str += "警告：未能获取 user_id，无法查询已绑定设备\n"
+            else:
+                bound_device_id = zeppHelper.get_user_device_id(app_token, self.user_id)
+                if bound_device_id:
+                    user_token_info["bound_device_id"] = bound_device_id
+                    user_tokens[self.user] = user_token_info
+                    self.log_str += f"查找到已绑定设备ID: {bound_device_id}\n"
+                else:
+                    self.log_str += "警告：未查到已绑定设备ID，请确认 Zepp Life 中已绑定手环或虚拟设备\n"
 
         ok, msg = zeppHelper.post_fake_brand_data(step, app_token, self.user_id, device_id=bound_device_id)
         return f"修改步数（{step}）[" + msg + "]", ok
