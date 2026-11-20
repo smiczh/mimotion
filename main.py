@@ -44,6 +44,35 @@ def get_min_max_by_time(hour=None, minute=None):
     return int(time_rate * min_step), int(time_rate * max_step)
 
 
+def get_fixed_step():
+    """获取固定步数（测试用）。
+
+    微信运动在多个数据源中取【最高值】，所以若想验证刷的步数是否生效，
+    必须写入一个明显大于手机真实步数的值（例如 25000），
+    否则会被手机传感器的真实步数盖掉，看起来就像"没生效"。
+
+    优先取环境变量 FIXED_STEP，其次取 CONFIG 的 FIXED_STEP；
+    都没设置时返回 None（按时间区间随机）。
+    """
+    val = os.environ.get("FIXED_STEP", "").strip()
+    if not val:
+        try:
+            val = str(config.get('FIXED_STEP', '') or '').strip()
+        except Exception:
+            val = ""
+    if not val:
+        return None
+    try:
+        n = int(val)
+    except ValueError:
+        print(f"FIXED_STEP 值无效（{val!r}），忽略，按时间区间随机")
+        return None
+    if n <= 0:
+        print(f"FIXED_STEP 必须为正数（{n}），忽略")
+        return None
+    return n
+
+
 # 虚拟ip地址
 def fake_ip():
     # 随便找的国内IP段：223.64.0.0 - 223.117.255.255
@@ -196,8 +225,14 @@ class MiMotionRunner:
         if app_token is None:
             return "登陆失败！", False
 
-        step = str(random.randint(min_step, max_step))
-        self.log_str += f"已设置为随机步数范围({min_step}~{max_step}) 随机值:{step}\n"
+        fixed = get_fixed_step()
+        if fixed is not None:
+            step = str(fixed)
+            self.log_str += (f"使用固定步数 FIXED_STEP={fixed}（测试用，"
+                             f"忽略时间区间 {min_step}~{max_step}）\n")
+        else:
+            step = str(random.randint(min_step, max_step))
+            self.log_str += f"已设置为随机步数范围({min_step}~{max_step}) 随机值:{step}\n"
         
         user_token_info = user_tokens.get(self.user, {})
         bound_device_id = user_token_info.get("bound_device_id")

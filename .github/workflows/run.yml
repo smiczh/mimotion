@@ -2,11 +2,16 @@ name: 刷步数
 
 on:
   schedule:
-    - cron: '57 0,3,6,9,12,14 * * *'
+    - cron: '28 0,3,6,9,12,14 * * *'
   workflow_dispatch:
     inputs:
       compat:
         description: '兼容模式（对照 Zepp-Life-Steps 定位微信同步问题）：stage_empty=stage置空 current_ts=当前时间戳 no_devid=不替换did cn2=cn2域名，用逗号分隔，留空为默认模式'
+        required: false
+        default: ''
+        type: string
+      fixed_step:
+        description: '固定步数（测试用）：填一个大于手机真实步数的值（如 25000），留空则按时间区间随机'
         required: false
         default: ''
         type: string
@@ -39,6 +44,8 @@ jobs:
             COMPAT_CURRENT_TS: ${{ contains(inputs.compat, 'current_ts') && '1' || '' }}
             COMPAT_NO_DEVID: ${{ contains(inputs.compat, 'no_devid') && '1' || '' }}
             COMPAT_CN2: ${{ contains(inputs.compat, 'cn2') && '1' || '' }}
+            # 固定步数（测试用）：留空则按时间区间随机
+            FIXED_STEP: ${{ inputs.fixed_step }}
         run: |
           pip3 install -r requirements.txt
           python3 main.py
