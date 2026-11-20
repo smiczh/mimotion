@@ -204,11 +204,21 @@ class MiMotionRunner:
                 app_token, msg = zeppHelper.grant_app_token(login_token)
                 if app_token is None:
                     # login_token 也失效了。先尝试【续期】而不是全新登录——
-                    # renew_login_token 只延长现有会话，不会创建新会话，
-                    # 因此不会把手机端 Zepp Life 的登录态顶掉。
-                    # 只有续期也失败，才用账号密码全新登录（这一步必然会顶号）。
-                    self.log_str += f"login_token 失效 尝试续期（不新建会话，避免顶掉手机端）\n"
-                    new_login_token, renew_msg = zeppHelper.renew_login_token(login_token)
+                    # 续期只延长现有会话，不会创建新会话，因此不会把手机端顶掉。
+                    #
+                    # 注意：续期要用与当初登录【相同身份】的接口。
+                    # 旧存档的 login_token 是手机身份(com.xiaomi.hm.health)登录得到的，
+                    # 拿它去 Web 续期接口续期无效；反过来对手机身份续期会续手机端会话，
+                    # 方向不对。所以按 login_source 标记分别处理：
+                    #   web   → 用 renew_login_token_web()（Web 身份续期）
+                    #   phone → 不续期，直接转 Web 全新登录（顺带把身份换成 Web）
+                    login_source = user_token_info.get("login_source", "phone")
+                    if login_source == "web":
+                        self.log_str += "login_token 失效 尝试Web身份续期（不新建会话）\n"
+                        new_login_token, renew_msg = zeppHelper.renew_login_token_web(login_token)
+                    else:
+                        self.log_str += "login_token 失效（旧存档为手机身份），直接转Web身份登录\n"
+                        new_login_token, renew_msg = None, "旧token为手机身份，跳过续期"
                     if new_login_token:
                         user_token_info["login_token"] = new_login_token
                         user_token_info["login_token_time"] = get_time()
@@ -221,8 +231,8 @@ class MiMotionRunner:
                             return app_token
                         self.log_str += f"续期后仍无法获取app_token：{msg}\n"
                     else:
-                        self.log_str += f"login_token续期失败：{renew_msg}\n"
-                    # 续期也失败，走【Web 身份】全新登录（不会顶掉手机端）
+                        self.log_str += f"login_token续期失败/跳过：{renew_msg}\n"
+                    # 续期不可行，走【Web 身份】全新登录（不会顶掉手机端）
                     self.log_str += "改为Web身份全新登录（不顶掉手机端登录态）\n"
                     ok_login, new_app_token = self._fresh_login()
                     if ok_login:
@@ -260,6 +270,8 @@ class MiMotionRunner:
                 info["user_id"] = user_id
                 info["app_token_time"] = get_time()
                 info["login_token_time"] = get_time()
+                # 记录登录身份：后续续期时选用对应身份的接口
+                info["login_source"] = "web"
                 if info.get("device_id") is None:
                     info["device_id"] = self.device_id
                 self.user_id = user_id
@@ -287,6 +299,8 @@ class MiMotionRunner:
         user_token_info["login_token"] = login_token
         user_token_info["app_token"] = app_token
         user_token_info["user_id"] = user_id
+        # 记录登录身份：后续续期时选用对应身份的接口
+        user_token_info["login_source"] = "phone"
         # 关键：必须同步赋值给 self.user_id，
         # 否则后续 get_user_device_id 会因 self.user_id 为 None 而被跳过，导致查不到设备
         self.user_id = user_id

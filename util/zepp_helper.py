@@ -230,15 +230,38 @@ def renew_login_token(login_token) -> (str | None, str | None):
         "appplatform": "android_phone"
     }
 
-    resp = requests.get(url, params=params, headers=headers)
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+    except Exception as e:
+        return None, f"请求异常：{type(e).__name__}"
     if resp.status_code != 200:
-        return None, "请求异常：%d" % resp.status_code
-    resp = resp.json()
-    result = resp["result"]
+        return None, f"请求异常：HTTP {resp.status_code}"
+    try:
+        body = resp.json()
+    except Exception:
+        return None, f"响应非JSON：{resp.text[:120]}"
 
-    if result != "ok":
-        return None, "请求失败：%s" % result
-    login_token = resp["token_info"]["login_token"]
+    # 注意：响应结构不固定，可能是 {"result":"ok","token_info":{...}}，
+    # 也可能是 {"code":0,"message":"...","token_info":{...}} 或直接是 token_info。
+    # 这里做防御性解析，不能直接下标取 result（否则 KeyError 崩掉整个任务）
+    result = body.get("result") if isinstance(body, dict) else None
+    token_info = {}
+    if isinstance(body, dict):
+        token_info = body.get("token_info") or {}
+        if not token_info and "login_token" in body:
+            token_info = body
+    if not isinstance(token_info, dict):
+        token_info = {}
+
+    login_token = token_info.get("login_token")
+    if not login_token:
+        if result is not None and result != "ok":
+            return None, f"请求失败：{result}"
+        return None, f"响应中无login_token：{str(body)[:150]}"
+
+    if result is not None and result != "ok":
+        return None, f"请求失败：{result}"
+
     return login_token, None
 
 
@@ -1058,3 +1081,53 @@ def login_web_tokens(user, password, country_code="CN"):
         return app_token, login_token, str(user_id), None
     except Exception as e:
         return None, None, None, f"Web登录异常: {type(e).__name__} {str(e)[:120]}"
+
+
+def renew_login_token_web(login_token) -> (str | None, str | None):
+    """续期【Web 身份】的 login_token。
+
+    与 renew_login_token（手机身份）对应的 Web 版本，
+    用于 Web 身份登录后 token 过期时的无感续期（不创建新会话、不顶号）。
+    """
+    url = "https://api-mifit.zepp.com/v1/client/renew_login_token"
+    headers = {
+        "app_name": WEB_APP_NAME,
+        "appname": WEB_APP_NAME,
+        "appplatform": "web",
+        "origin": "https://user.zepp.com",
+        "referer": "https://user.zepp.com/",
+        "user-agent": WEB_UA,
+        "x-request-id": str(uuid.uuid4()),
+    }
+    params = {
+        "os_version": "v1.0.0",
+        "dn": WEB_DN,
+        "login_token": login_token,
+        "source": WEB_APP_NAME,
+        "timestamp": get_time(),
+    }
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+    except Exception as e:
+        return None, f"请求异常：{type(e).__name__}"
+    if resp.status_code != 200:
+        return None, f"请求异常：HTTP {resp.status_code}"
+    try:
+        body = resp.json()
+    except Exception:
+        return None, f"响应非JSON：{resp.text[:120]}"
+
+    token_info = {}
+    if isinstance(body, dict):
+        token_info = body.get("token_info") or {}
+        if not token_info and "login_token" in body:
+            token_info = body
+    if not isinstance(token_info, dict):
+        token_info = {}
+    login_token_new = token_info.get("login_token")
+    if not login_token_new:
+        result = body.get("result") if isinstance(body, dict) else None
+        if result is not None and result != "ok":
+            return None, f"请求失败：{result}"
+        return None, f"响应中无login_token：{str(body)[:150]}"
+    return login_token_new, None
