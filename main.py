@@ -215,6 +215,13 @@ class MiMotionRunner:
                     self.log_str += "警告：未查到已绑定设备ID，请确认 Zepp Life 中已绑定手环或虚拟设备\n"
 
         ok, msg = zeppHelper.post_fake_brand_data(step, app_token, self.user_id, device_id=bound_device_id)
+        if ok:
+            # 回读云端数据：脚本返回 success 不等于数据已入库，
+            # 这里立刻读一次，可以马上区分"数据没写进去"和"写了但微信还没同步"
+            try:
+                zeppHelper.read_back_steps(app_token, self.user_id, device_id=bound_device_id)
+            except Exception as e:
+                print(f"云端回读异常（不影响提交结果）: {type(e).__name__} {str(e)[:100]}")
         return f"修改步数（{step}）[" + msg + "]", ok
 
 

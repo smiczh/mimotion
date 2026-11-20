@@ -4,6 +4,7 @@ import time
 import traceback
 import urllib
 import uuid
+import base64
 from datetime import datetime
 
 import pytz
@@ -503,3 +504,70 @@ def post_fake_brand_data(step, app_token, userid, device_id=None):
         return True, message
     else:
         return False, message
+
+
+def read_back_steps(app_token, userid, device_id=None, date=None) -> dict | None:
+    """回读华米云端当天步数，用于验证数据是否真的入库。
+
+    微信运动是每天凌晨拉取云端数据后展示，脚本返回 success 不等于数据已入库，
+    这里主动读一次，可以立刻区分"数据没写进去"与"写了但微信还没同步"。
+    """
+    if date is None:
+        date = get_beijing_time().strftime("%F")
+    url = "https://api-mifit-cn.huami.com/v1/data/band_data.json?" + urllib.parse.urlencode({
+        "query_type": "summary",
+        "device_type": "android_phone",
+        "userid": userid,
+        "from_date": date,
+        "to_date": date,
+    })
+    headers = {
+        "apptoken": app_token,
+        "User-Agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)",
+        "appname": "com.xiaomi.hm.health",
+        "appplatform": "android_phone",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            print(f"云端回读失败 HTTP {r.status_code}: {r.text[:150]}")
+            return None
+        j = r.json()
+    except Exception as e:
+        print(f"云端回读异常: {type(e).__name__} {str(e)[:100]}")
+        return None
+
+    items = j.get("items") or (j.get("data") or {}).get("items") or []
+    if not items:
+        print(f"云端回读：{date} 无数据项（数据可能尚未入库）")
+        return None
+
+    for it in items:
+        summary = it.get("summary")
+        if isinstance(summary, str):
+            try:
+                pad = (-len(summary)) % 4
+                s = json.loads(base64.b64decode(summary + "=" * pad).decode("utf-8"))
+            except Exception:
+                # 也可能是 URL 编码的明文 JSON
+                try:
+                    s = json.loads(urllib.parse.unquote(summary).replace('\\"', '"'))
+                except Exception:
+                    continue
+        elif isinstance(summary, dict):
+            s = summary
+        else:
+            continue
+
+        stp = s.get("stp") or {}
+        ttl = stp.get("ttl")
+        did = it.get("did") or s.get("did")
+        stages = stp.get("stage") or []
+        stage_sum = sum(int(x.get("step", 0) or 0) for x in stages) if stages else None
+        print(f"云端回读 {date}: 设备={did} 总步数={ttl}"
+              + (f" 明细合计={stage_sum}" if stage_sum is not None else "")
+              + (f" 距离={stp.get('dis')}m" if stp.get("dis") is not None else ""))
+        return {"date": date, "did": did, "ttl": ttl, "stage_sum": stage_sum,
+                "dis": stp.get("dis"), "cal": stp.get("cal")}
+    print(f"云端回读：{date} 未解析到 summary")
+    return None
