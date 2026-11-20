@@ -249,30 +249,40 @@ def get_user_device_id(app_token, userid) -> str | None:
     }
     try:
         resp = requests.get(url, headers=headers, timeout=5).json()
-        items = resp.get("items", [])
+        items = _extract_items(resp)
         if not items:
-            # 账号未绑定任何设备，明确提示，避免静默使用他人设备ID
-            print("未绑定任何设备：账号下无设备列表，请先在 Zepp Life 绑定手环或虚拟设备")
+            # 账号未绑定任何设备，或设备列表结构与预期不符
+            print(f"未取到设备列表，响应结构: {str(resp)[:200]}")
+            print("请先在 Zepp Life 绑定手环或虚拟设备")
             return None
-        if items:
-            # 1. 优先匹配 deviceType == 0 (手环/手表)
-            for item in items:
-                if item.get("deviceType") == 0:
-                    dev_id = item.get("deviceId") or item.get("mac")
-                    if dev_id:
-                        return str(dev_id).replace(":", "").upper()
-            # 2. 备选：按名称匹配
-            for item in items:
-                name = str(item.get("productName", "")).lower()
-                if any(k in name for k in ["band", "watch", "手环", "手表"]):
-                    dev_id = item.get("deviceId") or item.get("mac")
-                    if dev_id:
-                        return str(dev_id).replace(":", "").upper()
-            # 3. 兜底：取任意一个带 deviceId/mac 的条目，避免写入他人的默认设备
-            for item in items:
-                dev_id = item.get("deviceId") or item.get("mac")
+
+        # 1. 优先匹配 deviceType == 0 (手环/手表)
+        for item in items:
+            if isinstance(item, dict) and item.get("deviceType") == 0:
+                dev_id = _pick_device_id(item)
                 if dev_id:
-                    return str(dev_id).replace(":", "").upper()
+                    return dev_id
+        # 2. 按名称匹配手环/手表（排除体重秤等非计步设备）
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("productName", item.get("name", ""))).lower()
+            if any(k in name for k in ["band", "watch", "手环", "手表"]):
+                dev_id = _pick_device_id(item)
+                if dev_id:
+                    return dev_id
+        # 3. 兜底：取任意一个带设备ID的条目，避免写入他人的默认设备
+        for item in items:
+            # 跳过体重秤等不含计步传感器的设备
+            if isinstance(item, dict):
+                name = str(item.get("productName", item.get("name", ""))).lower()
+                if any(k in name for k in ["scale", "体重秤", "体脂秤"]):
+                    continue
+                if item.get("deviceType") in (2, 3):
+                    continue
+            dev_id = _pick_device_id(item)
+            if dev_id:
+                return dev_id
     except Exception as e:
         print(f"查询设备列表异常: {e}")
     return None
