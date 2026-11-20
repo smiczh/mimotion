@@ -372,10 +372,91 @@ def _select_device_id(items) -> str | None:
                 continue
             if item.get("deviceType") in (2, 3):
                 continue
-        dev_id = _pick_device_id(item)
-        if dev_id:
-            return dev_id
+    dev_id = _pick_device_id(item)
+    if dev_id:
+        return dev_id
     return None
+
+
+def _sync_summary_with_step(data_json: str, target_step: int) -> str:
+    """把 summary 中的活动明细与派生指标同步到目标步数。
+
+    data_json 形如:
+        %5B%7B%22summary%22%3A%22{\\"v\\":6,...}\" ... %7D%5D
+    其中 summary 的值是被 URL 编码过的 JSON 明文（含转义反斜杠）。
+
+    处理内容：
+    - stp.stage 各区间的 step 按比例缩放，使合计等于 target_step
+    - stp.dis / stp.cal / stp.wk / stp.rn / runDist / runCal 按同一比例缩放
+    - 保证"总步数 == 明细合计"，避免服务端判定数据异常而不推送给微信
+    """
+    try:
+        # 定位 summary 字段：%22summary%22%3A%22 ... %22
+        m = re.search(r'(%22summary%22%3A%22)(.*?)(%22(?:%2C|\"|,))', data_json, re.S)
+        if not m:
+            return data_json
+        raw_summary = m.group(2)
+        # URL 解码 -> JSON 解码（其中 \" 是转义的双引号）
+        decoded = urllib.parse.unquote(raw_summary).replace('\\"', '"')
+        summary = json.loads(decoded)
+    except Exception as e:
+        print(f"解析 summary 失败（跳过明细同步）: {e}")
+        return data_json
+
+    try:
+        stp = summary.get("stp")
+        if not isinstance(stp, dict):
+            return data_json
+
+        stages = stp.get("stage")
+        if not isinstance(stages, list) or not stages:
+            return data_json
+
+        old_total = sum(int(s.get("step", 0) or 0) for s in stages)
+        if old_total <= 0:
+            return data_json
+
+        ratio = target_step / old_total
+
+        # 按比例缩放每个区间的步数，并把舍入误差补到最后一个区间
+        acc = 0
+        last_idx = len(stages) - 1
+        for i, s in enumerate(stages):
+            if i == last_idx:
+                new_step = target_step - acc
+            else:
+                new_step = int(round(int(s.get("step", 0) or 0) * ratio))
+                if new_step < 0:
+                    new_step = 0
+                acc += new_step
+            s["step"] = new_step
+
+        # 派生指标按同一比例缩放，保证整体自洽
+        for key in ("dis", "cal"):
+            if isinstance(stp.get(key), (int, float)):
+                stp[key] = int(round(stp[key] * ratio))
+        for key in ("wk", "rn"):
+            if isinstance(stp.get(key), (int, float)):
+                stp[key] = int(round(stp[key] * ratio))
+        for key in ("runDist", "runCal"):
+            if isinstance(stp.get(key), (int, float)):
+                stp[key] = int(round(stp[key] * ratio))
+
+        # 同步总步数（外层正则改的是 URL 编码后的形式，
+        # 这里重新序列化整个 summary 会覆盖它，故必须再次显式赋值）
+        stp["ttl"] = target_step
+
+        # 回写：JSON 序列化 -> 转义双引号 -> URL 编码
+        new_raw = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        new_raw = new_raw.replace('"', '\\"')
+        new_raw = urllib.parse.quote(new_raw, safe="")
+        final_sum = sum(int(x.get("step", 0) or 0) for x in stages)
+        print(f"summary 步数已同步: ttl={stp.get('ttl')} 明细合计={final_sum} "
+              f"距离={stp.get('dis')}m 卡路里={stp.get('cal')}")
+        return data_json[:m.start(2)] + new_raw + data_json[m.end(2):]
+    except Exception as e:
+        print(f"同步 summary 明细失败（保留原值）: {e}")
+        return data_json
 
 
 def post_fake_brand_data(step, app_token, userid, device_id=None):
@@ -391,6 +472,11 @@ def post_fake_brand_data(step, app_token, userid, device_id=None):
     data_json = re.sub(find_date.findall(data_json)[0], today, str(data_json))
     data_json = re.sub(find_step.findall(data_json)[0], step, str(data_json))
 
+    # 关键修复：同步修正 summary 中的活动明细与派生指标。
+    # 原逻辑只改 stp.ttl，而 stage 明细/距离/卡路里仍是模板里原作者那天的数据，
+    # 导致"总步数 18148"与"明细合计 23904"自相矛盾，
+    # 华米侧校验判定数据异常，因而不会把数据推送给微信运动（脚本返回 success 但微信无变化）。
+    data_json = _sync_summary_with_step(data_json, int(step))
     url = f'https://api-mifit-cn.huami.com/v1/data/band_data.json?&t={t}&r={str(uuid.uuid4())}'
     head = {
         "apptoken": app_token,
