@@ -240,6 +240,35 @@ def renew_login_token(login_token) -> (str | None, str | None):
     return login_token, None
 
 
+def _extract_items(resp) -> list:
+    """从华米响应中提取设备列表。
+
+    华米 API 的业务数据通常在 data 字段下（如 {"code":0,"message":"success","data":{"items":[...]}}），
+    但不同接口/版本层级并不一致，这里做多层级兼容，避免永远取到空列表。
+    """
+    if not isinstance(resp, dict):
+        return []
+    # 依次尝试：顶层 -> data -> data.data
+    for container in (resp, resp.get("data"), (resp.get("data") or {}).get("data")):
+        if isinstance(container, dict):
+            for key in ("items", "list", "devices", "bands"):
+                val = container.get(key)
+                if isinstance(val, list) and val:
+                    return val
+    return []
+
+
+def _pick_device_id(item) -> str | None:
+    """从单个设备条目中提取设备ID，兼容多种字段名。"""
+    if not isinstance(item, dict):
+        return None
+    for key in ("deviceId", "device_id", "mac", "macAddress", "deviceMac", "did"):
+        val = item.get(key)
+        if val:
+            return str(val).replace(":", "").upper()
+    return None
+
+
 # 查询用户在华米云端绑定的手环/手表设备ID
 def get_user_device_id(app_token, userid) -> str | None:
     url = f"https://api-mifit-cn.huami.com/v1/device/binds.json?userid={userid}"
