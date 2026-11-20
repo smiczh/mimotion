@@ -266,54 +266,115 @@ def _pick_device_id(item) -> str | None:
         val = item.get(key)
         if val:
             return str(val).replace(":", "").upper()
+    # 部分接口把 ID 放在 additionalInfo 里（可能是 JSON 字符串）
+    info = item.get("additionalInfo")
+    if isinstance(info, str):
+        try:
+            info = json.loads(info)
+        except Exception:
+            info = None
+    if isinstance(info, dict):
+        for key in ("mac", "deviceId", "device_id", "macAddress"):
+            val = info.get(key)
+            if val:
+                return str(val).replace(":", "").upper()
     return None
 
 
 # 查询用户在华米云端绑定的手环/手表设备ID
 def get_user_device_id(app_token, userid) -> str | None:
-    url = f"https://api-mifit-cn.huami.com/v1/device/binds.json?userid={userid}"
-    headers = {
-        "apptoken": app_token,
-        "User-Agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)"
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=5).json()
-        items = _extract_items(resp)
-        if not items:
-            # 账号未绑定任何设备，或设备列表结构与预期不符
-            print(f"未取到设备列表，响应结构: {str(resp)[:200]}")
-            print("请先在 Zepp Life 绑定手环或虚拟设备")
-            return None
+    """查询账号绑定的设备ID。
 
-        # 1. 优先匹配 deviceType == 0 (手环/手表)
-        for item in items:
-            if isinstance(item, dict) and item.get("deviceType") == 0:
-                dev_id = _pick_device_id(item)
-                if dev_id:
-                    return dev_id
-        # 2. 按名称匹配手环/手表（排除体重秤等非计步设备）
-        for item in items:
-            if not isinstance(item, dict):
+    华米在不同版本/区域下提供了多个设备列表接口，旧接口可能已废弃
+    （返回 code -50000 "Failed to process the request"），因此这里按顺序轮询，
+    任一接口返回有效设备列表即返回。
+    """
+    ua = "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)"
+    base_headers = {
+        "apptoken": app_token,
+        "User-Agent": ua,
+        "appname": "com.xiaomi.hm.health",
+        "appplatform": "android_phone",
+    }
+    # (说明, URL, 附加请求头)
+    candidates = [
+        ("binds.json(mifit-cn)",
+         f"https://api-mifit-cn.huami.com/v1/device/binds.json?userid={userid}", {}),
+        ("users/{id}/devices(zepp)",
+         f"https://api.zepp.com/users/{userid}/devices", {}),
+        ("users/{id}/devices(zepp+appid)",
+         f"https://api.zepp.com/users/{userid}/devices?appid=428135909242707968"
+         f"&device_type=android_phone&device=android_31&enableMultiDevice=true", {}),
+        ("users/{id}/devices(mifit-cn3)",
+         f"https://api-mifit-cn3.zepp.com/users/{userid}/devices", {}),
+        ("binds.json(mifit-cn3)",
+         f"https://api-mifit-cn3.zepp.com/v1/device/binds.json?userid={userid}", {}),
+    ]
+
+    diagnostics = []
+    for label, url, extra in candidates:
+        headers = dict(base_headers)
+        headers.update(extra)
+        try:
+            r = requests.get(url, headers=headers, timeout=12)
+            body = r.text[:400].replace("\n", " ")
+            if r.status_code != 200:
+                diagnostics.append(f"  [{label}] HTTP {r.status_code} | {body[:180]}")
                 continue
-            name = str(item.get("productName", item.get("name", ""))).lower()
-            if any(k in name for k in ["band", "watch", "手环", "手表"]):
-                dev_id = _pick_device_id(item)
-                if dev_id:
-                    return dev_id
-        # 3. 兜底：取任意一个带设备ID的条目，避免写入他人的默认设备
-        for item in items:
-            # 跳过体重秤等不含计步传感器的设备
-            if isinstance(item, dict):
-                name = str(item.get("productName", item.get("name", ""))).lower()
-                if any(k in name for k in ["scale", "体重秤", "体脂秤"]):
-                    continue
-                if item.get("deviceType") in (2, 3):
-                    continue
+            try:
+                resp = r.json()
+            except Exception:
+                diagnostics.append(f"  [{label}] 非JSON响应 | {body[:180]}")
+                continue
+
+            items = _extract_items(resp)
+            if not items:
+                diagnostics.append(f"  [{label}] 响应无设备列表 | {str(resp)[:180]}")
+                continue
+
+            dev_id = _select_device_id(items)
+            if dev_id:
+                print(f"设备列表接口命中: {label}")
+                return dev_id
+            diagnostics.append(f"  [{label}] 有 {len(items)} 条但无有效设备ID")
+        except Exception as e:
+            diagnostics.append(f"  [{label}] 请求异常 {type(e).__name__}: {str(e)[:120]}")
+
+    print("全部设备列表接口均未取到设备，详情：")
+    for d in diagnostics:
+        print(d)
+    print("请确认 Zepp Life 中已绑定手环/虚拟设备，或该接口已被华米下线")
+    return None
+
+
+def _select_device_id(items) -> str | None:
+    """从设备列表中挑出合适的设备ID（手环/手表优先，跳过体重秤）。"""
+    # 1. 优先匹配 deviceType == 0 (手环/手表)
+    for item in items:
+        if isinstance(item, dict) and item.get("deviceType") == 0:
             dev_id = _pick_device_id(item)
             if dev_id:
                 return dev_id
-    except Exception as e:
-        print(f"查询设备列表异常: {e}")
+    # 2. 按名称匹配手环/手表（排除体重秤等非计步设备）
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("productName", item.get("name", ""))).lower()
+        if any(k in name for k in ["band", "watch", "手环", "手表"]):
+            dev_id = _pick_device_id(item)
+            if dev_id:
+                return dev_id
+    # 3. 兜底：取任意一个带设备ID的条目
+    for item in items:
+        if isinstance(item, dict):
+            name = str(item.get("productName", item.get("name", ""))).lower()
+            if any(k in name for k in ["scale", "体重秤", "体脂秤"]):
+                continue
+            if item.get("deviceType") in (2, 3):
+                continue
+        dev_id = _pick_device_id(item)
+        if dev_id:
+            return dev_id
     return None
 
 
