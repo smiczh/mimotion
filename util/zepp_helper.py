@@ -632,11 +632,40 @@ def read_back_steps(app_token, userid, device_id=None, date=None,
     result = None
     for attempt in range(1, max(1, retries) + 1):
         try:
-            r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code != 200:
-                print(f"云端回读失败 HTTP {r.status_code}: {r.text[:150]}")
+            # 多主机回读：不同区域/集群的数据可能存在同步差异，
+            # api-mifit.zepp.com 是 Zepp 官方当前使用的主机
+            last_err = None
+            resp_json = None
+            for host in ("https://api-mifit.zepp.com",
+                         "https://api-mifit-cn.zepp.com",
+                         "https://api-mifit-cn.huami.com"):
+                u = host + "/v1/data/band_data.json?" + urllib.parse.urlencode({
+                    "query_type": "summary",
+                    "device_type": "android_phone",
+                    "userid": userid,
+                    "from_date": date,
+                    "to_date": date,
+                })
+                try:
+                    rr = requests.get(u, headers=headers, timeout=15)
+                except Exception as e:
+                    last_err = f"{host}: {type(e).__name__}"
+                    continue
+                if rr.status_code != 200:
+                    last_err = f"{host}: HTTP {rr.status_code}"
+                    continue
+                try:
+                    resp_json = rr.json()
+                except Exception as e:
+                    last_err = f"{host}: 非JSON"
+                    continue
+                if _extract_items(resp_json):
+                    break
+                last_err = f"{host}: 无数据项"
+            if resp_json is None:
+                print(f"云端回读失败（所有主机）: {last_err}")
                 return None
-            j = r.json()
+            j = resp_json
         except Exception as e:
             print(f"云端回读异常: {type(e).__name__} {str(e)[:100]}")
             return None
@@ -842,29 +871,47 @@ def diagnose_sync(app_token, userid) -> dict:
     # 账号下若绑了多个设备，微信运动取的是"最高值"数据源，
     # 未启用/未激活的设备可能仍以真实步数参与计算，从而盖掉我们写入的虚拟设备步数。
     try:
-        url3 = "https://api-mifit-cn.huami.com/v1/data/band_data.json?" + urllib.parse.urlencode({
-            "query_type": "summary",
-            "device_type": "android_phone",
-            "userid": userid,
-            "from_date": get_beijing_time().strftime("%F"),
-            "to_date": get_beijing_time().strftime("%F"),
-            "with_device": "true",
-        })
+        # 同时尝试多个主机，Zepp 官方当前使用 api-mifit.zepp.com
         h3 = {
             "apptoken": app_token,
             "User-Agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)",
             "appname": "com.xiaomi.hm.health",
             "appplatform": "android_phone",
         }
-        r3 = requests.get(url3, headers=h3, timeout=15)
-        if r3.status_code == 200:
-            j3 = r3.json()
+        j3 = None
+        for host in ("https://api-mifit.zepp.com",
+                     "https://api-mifit-cn.zepp.com",
+                     "https://api-mifit-cn.huami.com"):
+            u = host + "/v1/data/band_data.json?" + urllib.parse.urlencode({
+                "query_type": "summary",
+                "device_type": "android_phone",
+                "userid": userid,
+                "from_date": get_beijing_time().strftime("%F"),
+                "to_date": get_beijing_time().strftime("%F"),
+            })
+            try:
+                rr = requests.get(u, headers=h3, timeout=15)
+            except Exception:
+                continue
+            if rr.status_code != 200:
+                continue
+            try:
+                jj = rr.json()
+            except Exception:
+                continue
+            if _extract_items(jj):
+                j3 = jj
+                print(f"设备源查询命中主机: {host}")
+                break
+        if j3 is not None:
             its = _extract_items(j3)
             print(f"\n设备源步数明细（共 {len(its)} 条）：")
             for it in its:
                 if not isinstance(it, dict):
                     continue
-                did = it.get("did") or it.get("deviceId") or "?"
+                # 真实字段名是 device_id / date_time（不是 did / date）
+                did = (it.get("device_id") or it.get("did") or it.get("deviceId") or "?")
+                dtime = it.get("date_time") or it.get("date")
                 ttl = None
                 sm = it.get("summary")
                 if isinstance(sm, str):
@@ -883,11 +930,11 @@ def diagnose_sync(app_token, userid) -> dict:
                 src = it.get("source", it.get("src", "?"))
                 # 完整打印条目，便于人工确认设备ID/日期等字段的真实名称
                 brief = {k: v for k, v in it.items() if k != "summary"}
-                print(f"  设备 {did}: 步数={ttl} source={src} date={it.get('date')}")
+                print(f"  设备 {did}: 步数={ttl} source={src} date={dtime}")
                 print(f"    条目全字段: {json.dumps(brief, ensure_ascii=False)[:300]}")
             out["device_sources"] = its
         else:
-            print(f"设备源步数明细: HTTP {r3.status_code}")
+            print("设备源步数明细: 所有主机均无数据")
     except Exception as e:
         print(f"设备源步数明细异常: {type(e).__name__} {str(e)[:100]}")
 

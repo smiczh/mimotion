@@ -2,8 +2,14 @@ name: 刷步数
 
 on:
   schedule:
-    - cron: '46 0,3,6,9,12,14 * * *'
+    - cron: '28 0,3,6,9,12,14 * * *'
   workflow_dispatch:
+    inputs:
+      compat:
+        description: '兼容模式（对照 Zepp-Life-Steps 定位微信同步问题）：stage_empty=stage置空 current_ts=当前时间戳 no_devid=不替换did cn2=cn2域名，用逗号分隔，留空为默认模式'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   build:
@@ -18,16 +24,21 @@ jobs:
         run: |
           sudo -E apt-get -qq update
           sudo -E apt-get install zsh -y
-          
+
       - name: 初始化Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.10"
-          
+
       - name: 开始
         env:
             CONFIG: ${{ secrets.CONFIG }}
             AES_KEY: ${{ secrets.AES_KEY }}
+            # 手动触发的兼容模式参数（定时任务不传，保持默认模式）
+            COMPAT_STAGE_EMPTY: ${{ contains(inputs.compat, 'stage_empty') && '1' || '' }}
+            COMPAT_CURRENT_TS: ${{ contains(inputs.compat, 'current_ts') && '1' || '' }}
+            COMPAT_NO_DEVID: ${{ contains(inputs.compat, 'no_devid') && '1' || '' }}
+            COMPAT_CN2: ${{ contains(inputs.compat, 'cn2') && '1' || '' }}
         run: |
           pip3 install -r requirements.txt
           python3 main.py
