@@ -620,3 +620,143 @@ def read_back_steps(app_token, userid, device_id=None, date=None,
                   f"期望 ≥ {expect_step}），{retry_delay} 秒后重试...")
             time.sleep(retry_delay)
     return result
+
+
+def diagnose_sync(app_token, userid) -> dict:
+    """诊断微信同步链路的最后两个未知环节。
+
+    1) 账号维度步数：getUserInfo 返回账号汇总数据，微信推送读的是这一层，
+       而 band_data 写的是设备维度。若这里查不到 23714，说明数据没聚合到账号维度。
+    2) 第三方接入状态：查询账号已绑定的第三方平台，确认微信绑定是否存在。
+    """
+    out = {}
+
+    # ---------- 1. 账号维度步数 ----------
+    try:
+        url = "https://api-mifit-cn3.zepp.com/huami.health.getUserInfo.json"
+        params = {
+            "r": str(uuid.uuid4()),
+            "userid": str(userid),
+            "appid": "428135909242707968",
+            "channel": "Normal",
+            "country": "CN",
+            "cv": "50818_6.14.0",
+            "device": "android_31",
+            "device_type": "android_phone",
+            "lang": "zh_CN",
+            "timezone": "Asia/Shanghai",
+            "v": "2.0",
+        }
+        headers = {
+            "apptoken": app_token,
+            "User-Agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)",
+            "appname": "com.xiaomi.hm.health",
+            "appplatform": "android_phone",
+        }
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        if r.status_code == 200:
+            j = r.json()
+            data = j.get("data") or {}
+            # 账号维度常见的步数字段
+            step = None
+            for k in ("step", "steps", "todayStep", "stepCount", "totalStep"):
+                if k in data:
+                    step = data[k]
+                    break
+            print(f"账号维度查询: HTTP 200, 返回字段 {list(data.keys())[:12]}")
+            if step is not None:
+                print(f"  ★ 账号维度步数 = {step}")
+            else:
+                print("  （返回中未直接包含步数字段）")
+            out["user_info"] = data
+            out["account_step"] = step
+        else:
+            print(f"账号维度查询: HTTP {r.status_code} {r.text[:150]}")
+    except Exception as e:
+        print(f"账号维度查询异常: {type(e).__name__} {str(e)[:120]}")
+
+    # ---------- 2. 第三方接入（微信绑定）状态 ----------
+    try:
+        url2 = f"https://api-mifit-cn3.zepp.com/v1/user/thirdparty.json?userid={userid}"
+        h2 = {
+            "apptoken": app_token,
+            "User-Agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)",
+            "appname": "com.xiaomi.hm.health",
+            "appplatform": "android_phone",
+        }
+        r2 = requests.get(url2, headers=h2, timeout=12)
+        if r2.status_code == 200:
+            j2 = r2.json()
+            items = _extract_items(j2)
+            if items:
+                names = []
+                for it in items:
+                    if isinstance(it, dict):
+                        names.append({k: v for k, v in it.items()
+                                      if isinstance(k, str) and k.lower() in
+                                      ("name", "appname", "platform", "type", "status", "bindstatus")})
+                    else:
+                        names.append(str(it)[:60])
+                print(f"第三方接入查询: HTTP 200，共 {len(items)} 条")
+                for n in names[:8]:
+                    print(f"  - {n}")
+                out["third_party"] = items
+            else:
+                print(f"第三方接入查询: HTTP 200，响应: {str(j2)[:200]}")
+                out["third_party"] = j2
+        else:
+            print(f"第三方接入查询: HTTP {r2.status_code} {r2.text[:120]}")
+    except Exception as e:
+        print(f"第三方接入查询异常: {type(e).__name__} {str(e)[:100]}")
+
+    # ---------- 3. 各设备源的当日步数（多设备冲突排查） ----------
+    # 账号下若绑了多个设备，微信运动取的是"最高值"数据源，
+    # 未启用/未激活的设备可能仍以真实步数参与计算，从而盖掉我们写入的虚拟设备步数。
+    try:
+        url3 = "https://api-mifit-cn.huami.com/v1/data/band_data.json?" + urllib.parse.urlencode({
+            "query_type": "summary",
+            "device_type": "android_phone",
+            "userid": userid,
+            "from_date": get_beijing_time().strftime("%F"),
+            "to_date": get_beijing_time().strftime("%F"),
+            "with_device": "true",
+        })
+        h3 = {
+            "apptoken": app_token,
+            "User-Agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)",
+            "appname": "com.xiaomi.hm.health",
+            "appplatform": "android_phone",
+        }
+        r3 = requests.get(url3, headers=h3, timeout=15)
+        if r3.status_code == 200:
+            j3 = r3.json()
+            its = _extract_items(j3)
+            print(f"\n设备源步数明细（共 {len(its)} 条）：")
+            for it in its:
+                if not isinstance(it, dict):
+                    continue
+                did = it.get("did") or it.get("deviceId") or "?"
+                ttl = None
+                sm = it.get("summary")
+                if isinstance(sm, str):
+                    try:
+                        pad = (-len(sm)) % 4
+                        s2 = json.loads(base64.b64decode(sm + "=" * pad).decode("utf-8"))
+                        ttl = (s2.get("stp") or {}).get("ttl")
+                    except Exception:
+                        try:
+                            s2 = json.loads(urllib.parse.unquote(sm).replace('\\"', '"'))
+                            ttl = (s2.get("stp") or {}).get("ttl")
+                        except Exception:
+                            pass
+                elif isinstance(sm, dict):
+                    ttl = (sm.get("stp") or {}).get("ttl")
+                src = it.get("source", it.get("src", "?"))
+                print(f"  设备 {did}: 步数={ttl} source={src} date={it.get('date')}")
+            out["device_sources"] = its
+        else:
+            print(f"设备源步数明细: HTTP {r3.status_code}")
+    except Exception as e:
+        print(f"设备源步数明细异常: {type(e).__name__} {str(e)[:100]}")
+
+    return out

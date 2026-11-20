@@ -218,12 +218,17 @@ class MiMotionRunner:
         if ok:
             # 回读云端数据：脚本返回 success 不等于数据已入库，
             # 这里立刻读一次，可以马上区分"数据没写进去"和"写了但微信还没同步"
-            # 华米云端有缓存延迟，可能读到上一次的旧值，故传入期望步数触发重试
+            # 华米对同一天取最大值，可能读到之前某次运行的更大值
             try:
                 zeppHelper.read_back_steps(app_token, self.user_id, device_id=bound_device_id,
                                            expect_step=int(step))
             except Exception as e:
                 print(f"云端回读异常（不影响提交结果）: {type(e).__name__} {str(e)[:100]}")
+            # 诊断同步链路：账号维度步数 + 第三方接入（微信绑定）状态
+            try:
+                zeppHelper.diagnose_sync(app_token, self.user_id)
+            except Exception as e:
+                print(f"同步诊断异常（不影响提交结果）: {type(e).__name__} {str(e)[:100]}")
         return f"修改步数（{step}）[" + msg + "]", ok
 
 
