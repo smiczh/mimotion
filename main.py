@@ -33,6 +33,21 @@ def get_int_value_default(_config: dict, _key, default):
 
 
 # 获取当前时间对应的最大和最小步数
+def get_dual_device_write() -> bool:
+    """是否双设备写入（同时写本账号设备与默认设备）。
+
+    ⚠️ 默认关闭。开启后会额外把数据写到默认设备 DA932FFFFE8816E7
+    （那是原作者的设备），仅用于对照实验定位微信读的是哪个 did。
+    """
+    val = os.environ.get("DUAL_DEVICE_WRITE", "").strip().lower()
+    if not val:
+        try:
+            val = str(config.get('DUAL_DEVICE_WRITE', '') or '').strip().lower()
+        except Exception:
+            val = ""
+    return val in ("1", "true", "yes", "on")
+
+
 def get_phone_fallback_on_submit() -> bool:
     """Web 身份 token 提交数据失败时，是否用手机身份重新登录再提交。
 
@@ -389,8 +404,13 @@ class MiMotionRunner:
                 else:
                     self.log_str += "警告：未查到已绑定设备ID，请确认 Zepp Life 中已绑定手环或虚拟设备\n"
 
-        ok, msg = zeppHelper.post_fake_brand_data(step, app_token, self.user_id,
-                                                   device_id=bound_device_id, cfg=config)
+        if get_dual_device_write():
+            # 对照实验：同时写本账号设备与默认设备，覆盖微信读哪个 did 的可能
+            ok, msg, _res = zeppHelper.post_dual_device(
+                step, app_token, self.user_id, bound_device_id, cfg=config)
+        else:
+            ok, msg = zeppHelper.post_fake_brand_data(step, app_token, self.user_id,
+                                                       device_id=bound_device_id, cfg=config)
         if not ok and get_phone_fallback_on_submit():
             # Web 身份的 token 可能无法写入 band_data（服务端 500）。
             # 此时用手机身份重新登录拿 token 再提交一次。
@@ -418,6 +438,11 @@ class MiMotionRunner:
                 zeppHelper.diagnose_sync(app_token, self.user_id)
             except Exception as e:
                 print(f"同步诊断异常（不影响提交结果）: {type(e).__name__} {str(e)[:100]}")
+            # 接口全探测：找出账号维度当日步数与第三方接入状态的真实接口
+            try:
+                zeppHelper.probe_endpoints(app_token, self.user_id)
+            except Exception as e:
+                print(f"接口探测异常（不影响提交结果）: {type(e).__name__} {str(e)[:100]}")
         return f"修改步数（{step}）[" + msg + "]", ok
 
 

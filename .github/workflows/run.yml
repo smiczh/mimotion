@@ -15,6 +15,11 @@ on:
         required: false
         default: ''
         type: string
+      dual_write:
+        description: '双设备写入（对照实验）：同时写本账号设备与默认设备，定位微信读哪个 did。⚠️会额外写入原作者设备，仅实验用'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   build:
@@ -46,6 +51,8 @@ jobs:
             COMPAT_CN2: ${{ contains(inputs.compat, 'cn2') && '1' || '' }}
             # 固定步数（测试用）：留空则按时间区间随机
             FIXED_STEP: ${{ inputs.fixed_step }}
+            # 双设备写入（对照实验）：留空则只写本账号设备
+            DUAL_DEVICE_WRITE: ${{ inputs.dual_write }}
         run: |
           pip3 install -r requirements.txt
           python3 main.py

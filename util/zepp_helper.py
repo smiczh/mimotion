@@ -1257,3 +1257,159 @@ def _build_submit_attempts(base_url, base_head, app_token, compat=None):
                      "https://api-mifit.zepp.com/v1/data/band_data.json?&t={t}&r={uuid.uuid4()}",
                      mk(web_head)))
     return attempts
+
+
+def probe_endpoints(app_token, userid, date=None):
+    """接口全探测：找出账号维度当日步数、以及第三方接入(微信绑定)状态的实际接口。
+
+    背景：设备维度(band_data)已确认写入正确，但微信运动读的是账号维度，
+    需要找出真正承载"账号当日步数"和"第三方接入状态"的接口路径。
+
+    打印所有返回有效数据的接口，便于一次性定位。
+    """
+    if date is None:
+        date = get_beijing_time().strftime("%F")
+    h = {
+        "apptoken": app_token,
+        "User-Agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)",
+        "appname": "com.xiaomi.hm.health",
+        "appplatform": "android_phone",
+        "hm-privacy-diagnostics": "false",
+        "hm-privacy-ceip": "true",
+        "country": "CN",
+        "timezone": "Asia/Shanghai",
+        "channel": "a100900101016",
+        "cv": "50818_6.14.0",
+        "v": "2.0",
+        "lang": "zh_CN",
+        "x-request-id": str(uuid.uuid4()),
+    }
+    hosts = ["https://api-mifit-cn.huami.com",
+             "https://api-mifit.zepp.com",
+             "https://api-mifit-cn3.zepp.com"]
+
+    print("\n========== 接口探测：账号维度当日步数 ==========")
+    data_paths = [
+        "/v1/data/band_data.json",
+        "/v1/data/day_data.json",
+        "/v1/data/daily_data.json",
+        "/v1/data/user_data.json",
+        "/v1/data/account_data.json",
+        "/v1/data/summary.json",
+        "/v1/data/statistics.json",
+        "/v1/data/steps.json",
+        "/v1/data/today.json",
+    ]
+    qtypes = ["summary", "detail", "today", "all", "current", "step", "steps", "latest"]
+    found = 0
+    for host in hosts:
+        for path in data_paths:
+            for qt in qtypes:
+                u = host + path + "?" + urllib.parse.urlencode({
+                    "query_type": qt, "device_type": "android_phone",
+                    "userid": userid, "from_date": date, "to_date": date})
+                try:
+                    r = requests.get(u, headers=h, timeout=8)
+                except Exception:
+                    continue
+                if r.status_code != 200:
+                    continue
+                try:
+                    j = r.json()
+                except Exception:
+                    continue
+                items = _extract_items(j)
+                if not items:
+                    continue
+                # 解析出步数
+                for it in items[:1]:
+                    if not isinstance(it, dict):
+                        continue
+                    ttl = None
+                    sm = it.get("summary")
+                    for parse in (lambda s: json.loads(base64.b64decode(
+                        s + "=" * ((-len(s)) % 4)).decode("utf-8")),
+                        lambda s: json.loads(urllib.parse.unquote(s).replace('\\"', '"'))):
+                        try:
+                            o = parse(sm)
+                            ttl = (o.get("stp") or {}).get("ttl")
+                            break
+                        except Exception:
+                            continue
+                    keys = [k for k in it.keys() if k != "summary"]
+                    print(f"  ✔ {host.split('//')[1][:22]:24s}{path:28s} qt={qt:8s} "
+                          f"ttl={ttl} 字段={keys}")
+                    found += 1
+                    break
+    if not found:
+        print("  （未探测到返回数据的接口）")
+
+    print("\n========== 接口探测：第三方接入(微信绑定)状态 ==========")
+    tp_paths = [
+        "/v1/user/thirdparty.json",
+        "/v1/user/third_party.json",
+        "/v1/user/thirdparty/list.json",
+        "/v1/user/thirdparty_info.json",
+        "/v1/user/thirdParty.json",
+        "/v2/user/thirdparty.json",
+        "/v1/thirdparty.json",
+        "/v1/user/oauth.json",
+        "/v1/user/third_party_info.json",
+        "/huami.health.getThirdPartyInfo.json",
+        "/v1/user/wechat.json",
+        "/v1/user/tencent.json",
+    ]
+    tp_found = 0
+    for host in hosts:
+        for path in tp_paths:
+            u = f"{host}{path}?userid={userid}"
+            try:
+                r = requests.get(u, headers=h, timeout=8)
+            except Exception:
+                continue
+            if r.status_code != 200:
+                continue
+            try:
+                j = r.json()
+            except Exception:
+                continue
+            items = _extract_items(j)
+            if items:
+                print(f"  ✔ {host.split('//')[1][:22]:24s}{path}")
+                for it in items[:6]:
+                    print(f"       {json.dumps(it, ensure_ascii=False)[:200]}")
+                tp_found += 1
+                break
+            else:
+                print(f"  · {host.split('//')[1][:22]:24s}{path:34s} 200但无items: {str(j)[:120]}")
+    if not tp_found:
+        print("  （未探测到第三方接入接口，可能需要不同的鉴权或路径）")
+    return {"data_found": found, "tp_found": tp_found}
+
+
+def post_dual_device(step, app_token, userid, device_id, cfg=None):
+    """双设备写入：同时写到本账号设备与默认设备。
+
+    用途：微信运动读的是哪个 did 目前不确定——
+    参考实现(Zepp-Life-Steps)从不替换 did，始终写 DA932FFFFE8816E7；
+    而我们替换成本账号的绑定设备。若华米账号维度聚合时只认某个 did，
+    单写一个就可能同步不到。
+
+    双写覆盖两种可能：
+      1) 账号维度只认默认设备 → 第二写生效
+      2) 账号维度只认本账号已绑定设备 → 第一写生效
+    两个都写，任一成功即算成功。
+    """
+    results = []
+    # 写 1：本账号的绑定设备（正确做法，数据落在自己的账号下）
+    ok1, msg1 = post_fake_brand_data(step, app_token, userid,
+                                      device_id=device_id, cfg=cfg)
+    results.append(("本账号设备", ok1, msg1))
+    # 写 2：默认设备（与参考实现一致，覆盖"只认默认 did"的情况）
+    ok2, msg2 = post_fake_brand_data(step, app_token, userid,
+                                      device_id="DA932FFFFE8816E7", cfg=cfg)
+    results.append(("默认设备", ok2, msg2))
+    for label, ok, msg in results:
+        print(f"  双写[{label}]: {'成功' if ok else '失败'} - {msg}")
+    ok_any = any(ok for _, ok, _ in results)
+    return ok_any, (msg1 if ok1 else msg2), results
