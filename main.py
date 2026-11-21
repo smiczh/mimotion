@@ -33,6 +33,17 @@ def get_int_value_default(_config: dict, _key, default):
 
 
 # 获取当前时间对应的最大和最小步数
+def get_probe_enabled() -> bool:
+    """是否运行接口全探测（200+ 次请求，仅调试用，默认关）。"""
+    val = os.environ.get("PROBE", "").strip().lower()
+    if not val:
+        try:
+            val = str(config.get('PROBE', '') or '').strip().lower()
+        except Exception:
+            val = ""
+    return val in ("1", "true", "yes", "on")
+
+
 def get_dual_device_write() -> bool:
     """是否双设备写入（同时写本账号设备与默认设备）。
 
@@ -439,10 +450,12 @@ class MiMotionRunner:
             except Exception as e:
                 print(f"同步诊断异常（不影响提交结果）: {type(e).__name__} {str(e)[:100]}")
             # 接口全探测：找出账号维度当日步数与第三方接入状态的真实接口
-            try:
-                zeppHelper.probe_endpoints(app_token, self.user_id)
-            except Exception as e:
-                print(f"接口探测异常（不影响提交结果）: {type(e).__name__} {str(e)[:100]}")
+            # 默认不跑（一次要 200+ 请求，拖慢定时任务），需要时用 PROBE=1 开启
+            if get_probe_enabled():
+                try:
+                    zeppHelper.probe_endpoints(app_token, self.user_id)
+                except Exception as e:
+                    print(f"接口探测异常（不影响提交结果）: {type(e).__name__} {str(e)[:100]}")
         return f"修改步数（{step}）[" + msg + "]", ok
 
 

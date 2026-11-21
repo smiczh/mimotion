@@ -1388,28 +1388,27 @@ def probe_endpoints(app_token, userid, date=None):
 
 
 def post_dual_device(step, app_token, userid, device_id, cfg=None):
-    """双设备写入：同时写到本账号设备与默认设备。
+    """双设备写入：先写默认设备，再写本账号设备（顺序很重要）。
 
-    用途：微信运动读的是哪个 did 目前不确定——
-    参考实现(Zepp-Life-Steps)从不替换 did，始终写 DA932FFFFE8816E7；
-    而我们替换成本账号的绑定设备。若华米账号维度聚合时只认某个 did，
-    单写一个就可能同步不到。
+    背景：实测发现华米服务端对同一 (uid, date) 只保留一条 summary 记录，
+    device_id 取【最后一次写入时声明的设备】。
+    因此顺序必须是「默认设备 → 本账号设备」，
+    否则最后记录会归属默认设备(原作者的)，反而覆盖掉自己设备上的记录。
 
-    双写覆盖两种可能：
-      1) 账号维度只认默认设备 → 第二写生效
-      2) 账号维度只认本账号已绑定设备 → 第一写生效
-    两个都写，任一成功即算成功。
+    用途：对照实验。参考实现(Zepp-Life-Steps)从不替换 did，始终写
+    DA932FFFFE8816E7；若微信读的是默认 did，单写自己设备就同步不到，
+    双写可覆盖这种可能。
     """
     results = []
-    # 写 1：本账号的绑定设备（正确做法，数据落在自己的账号下）
+    # 写 1：默认设备（与参考实现一致）
     ok1, msg1 = post_fake_brand_data(step, app_token, userid,
-                                      device_id=device_id, cfg=cfg)
-    results.append(("本账号设备", ok1, msg1))
-    # 写 2：默认设备（与参考实现一致，覆盖"只认默认 did"的情况）
-    ok2, msg2 = post_fake_brand_data(step, app_token, userid,
                                       device_id="DA932FFFFE8816E7", cfg=cfg)
-    results.append(("默认设备", ok2, msg2))
+    results.append(("默认设备", ok1, msg1))
+    # 写 2：本账号设备（放最后，保证最终记录归属自己的账号）
+    ok2, msg2 = post_fake_brand_data(step, app_token, userid,
+                                      device_id=device_id, cfg=cfg)
+    results.append(("本账号设备", ok2, msg2))
     for label, ok, msg in results:
         print(f"  双写[{label}]: {'成功' if ok else '失败'} - {msg}")
     ok_any = any(ok for _, ok, _ in results)
-    return ok_any, (msg1 if ok1 else msg2), results
+    return ok_any, (msg2 if ok2 else msg1), results
