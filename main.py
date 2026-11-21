@@ -117,6 +117,16 @@ def get_min_max_by_time(hour=None, minute=None):
     time_rate = min((hour * 60 + minute) / (22 * 60), 1)
     min_step = get_int_value_default(config, 'MIN_STEP', 18000)
     max_step = get_int_value_default(config, 'MAX_STEP', 25000)
+
+    # ★ 关键避坑：微信运动对"小于等于 25000"的步数可能不显示/不推送。
+    # 实测：写 25000 → 微信运动不更新；写 26000 → 立即生效。
+    # 因此把区间上限抬到 26000 以上，避免定时任务写出无效值。
+    # （可用配置 SYNC_MIN_STEP 覆盖，设为 0 可关闭此保护）
+    guard = get_int_value_default(config, 'SYNC_MIN_STEP', 26000)
+    if guard > 0 and max_step < guard:
+        max_step = guard
+        min_step = min(min_step, int(guard * 0.92))
+        print(f"步数上限已自动抬升到 {guard}（微信运动对 ≤25000 的步数可能不显示）")
     return int(time_rate * min_step), int(time_rate * max_step)
 
 
@@ -398,6 +408,14 @@ class MiMotionRunner:
                              f"忽略时间区间 {min_step}~{max_step}）\n")
         else:
             step = str(random.randint(min_step, max_step))
+            # ★ 关键避坑：微信运动对 ≤25000 的步数可能不显示（实测 25000 无效、26000 生效）。
+            # 早上时段区间较小（如 08:28 只有 ~7000~10000），写进去也白写，
+            # 所以这里保证任何时段写入的值都不低于生效阈值。
+            guard = get_int_value_default(config, 'SYNC_MIN_STEP', 26000)
+            if guard > 0 and int(step) < guard:
+                step = str(random.randint(guard, max(int(step), guard) + 2000))
+                self.log_str += (f"步数已提升到生效阈值以上（≥{guard}），"
+                                 f"最终值:{step}\n")
             self.log_str += f"已设置为随机步数范围({min_step}~{max_step}) 随机值:{step}\n"
         
         user_token_info = user_tokens.get(self.user, {})
